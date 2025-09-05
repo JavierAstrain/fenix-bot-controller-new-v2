@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Fénix Automotriz — Agente de Negocio (RAG Híbrido) con:
-- FECHAS ESTRICTAS (>= hoy cuando hay intención de futuro)
-- Detección de MES en español (p. ej., "facturación de marzo [2025]") y filtro exacto por mes
-- Gráfico por TIPO CLIENTE para consultas de facturación por mes
-- Totales, filtros robustos, OT "Sin asignar", y recuperación sólo del subconjunto filtrado
+Fénix Automotriz — Agente de Negocio (RAG Híbrido)
+MEJORA: Analizador de intenciones robusto para MES en español (enero..diciembre)
+- Si la pregunta especifica un MES (y opcionalmente AÑO), se aplica PRIMERO un filtro estricto por ese mes.
+- El índice vectorial SIEMPRE se construye sobre ese subconjunto mensual (sin mezclar otros meses).
+- Compatibilidad con guardarraíl de futuro (>= hoy) cuando NO hay mes explícito.
+- Mantiene: filtros robustos, OT “Sin asignar”, totales y gráfico por TIPO CLIENTE.
 
-Requiere: streamlit, pandas, numpy, gspread, google-auth, openai, (chroma opcional)
+Requiere: streamlit, pandas, numpy, gspread, google-auth, openai, (chromadb opcional)
 """
 
 import os, re, json, hashlib, datetime as dt
@@ -77,7 +78,7 @@ SPANISH_MONTHS = {
     "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
 }
 
-# ---------- Utils ----------
+# ---------- Utilidades ----------
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", unidecode(str(s)).strip().lower())
 
@@ -274,7 +275,7 @@ def retrieve_top_subset(query: str, k=6) -> Tuple[List[str], List[str]]:
 def system_prompt() -> str:
     return f"""
 Eres un CONSULTOR DE GESTIÓN y ANALISTA DE DATOS para Fénix Automotriz.
-Usa EXCLUSIVAMENTE el “Contexto proporcionado” (ya filtrado por condiciones, MES cuando aplique y/o FECHAS ≥ HOY).
+Usa EXCLUSIVAMENTE el “Contexto proporcionado” (ya filtrado: MES cuando aplique y/o FECHAS ≥ HOY).
 Si falta información, responde: "No tengo la información necesaria en los datos".
 Cuando la pregunta implique montos, calcula y muestra la SUMA TOTAL.
 Contexto:
@@ -292,7 +293,7 @@ def llm_answer(question: str, docs: List[str]):
     resp=client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.2)
     return resp.choices[0].message.content, messages
 
-# ---------- Parser + reglas ----------
+# ---------- Parser / reglas genéricas ----------
 def infer_schema_for_llm(df: pd.DataFrame) -> Dict[str,Any]:
     schema={}
     for c in df.columns:
@@ -360,28 +361,39 @@ def detect_future_intent(question: str) -> bool:
     keys=["proxim","próxim","pronto","futuro","en adelante","desde hoy","a partir de hoy","hoy en adelante","venider"]
     return any(k in q for k in keys)
 
-# --------- NUEVO: Detección robusta de MES (y año opcional) ----------
-def parse_explicit_month_year(question: str) -> Tuple[Optional[int], Optional[int]]:
+# ---------- NUEVO: MES — Analizador robusto y filtro PRIMARIO ----------
+def parse_explicit_month_year(question: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     """
-    Busca un nombre de mes en español y un año opcional cercano (ej. 'marzo', 'marzo 2025', 'de marzo del 2024').
-    Retorna (mes_num, año) o (None, None) si no hay coincidencia.
+    Detecta un nombre de mes en español (con acentos normalizados) y un AÑO opcional.
+    Retorna (month_num, year, matched_month_name) o (None, None, None).
+    Coincidencias por palabra completa para evitar falsos positivos (p.ej. 'marca' ≠ 'marzo').
     """
     q=_norm(question)
-    month_found=None
     for name, num in SPANISH_MONTHS.items():
+        # palabra completa
         if re.search(rf"\b{name}\b", q):
-            month_found=num
-            # buscar año cercano (20xx / 19xx)
             m=re.search(r"(19|20)\d{2}", q)
-            year_found=int(m.group(0)) if m else None
-            return month_found, year_found
-    return None, None
+            year=int(m.group(0)) if m else None
+            return num, year, name
+    return None, None, None
 
-def month_to_range(year: int, month: int) -> Tuple[str, str]:
-    last = monthrange(year, month)[1]
-    start = dt.date(year, month, 1).strftime("%Y-%m-%d")
-    end   = dt.date(year, month, last).strftime("%Y-%m-%d")
+def month_to_range(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    start = pd.Timestamp(year=year, month=month, day=1)
+    end = pd.Timestamp(year=year, month=month, day=monthrange(year, month)[1])
     return start, end
+
+def apply_month_filter_first(df: pd.DataFrame, month: int, year: int, date_col: str) -> pd.DataFrame:
+    """
+    Filtro PRIMARIO: Se aplica ANTES de cualquier otro filtro.
+    Acepta solo filas cuyo date_col pertenece al mes/año indicados.
+    No hace fallback. NaT quedan fuera (estricto).
+    """
+    if date_col not in df.columns: return pd.DataFrame()
+    s = df[date_col]
+    if not pd.api.types.is_datetime64_any_dtype(s):
+        s = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    mask = (s.dt.year == year) & (s.dt.month == month)
+    return df[mask].copy()
 
 def enforce_future_guardrail(filters: List[Dict[str,Any]], df: pd.DataFrame, question: str) -> Tuple[List[Dict[str,Any]], Optional[str]]:
     """Si intención futura, impone >= HOY en columna de fecha pertinente."""
@@ -412,7 +424,7 @@ def enforce_future_guardrail(filters: List[Dict[str,Any]], df: pd.DataFrame, que
         out.append({"column":date_col,"op":"gte","value":[today]})
     return out, date_col
 
-# ---------- Filtro robusto ----------
+# ---------- Filtro robusto (genérico, secundario) ----------
 def _ensure_list(x):
     if isinstance(x,list): return x
     if x is None: return []
@@ -508,9 +520,8 @@ def append_totals_row(display_df: pd.DataFrame) -> pd.DataFrame:
             total_row[col]=pd.to_numeric(display_df[col], errors="coerce").sum(skipna=True)
     return pd.concat([display_df, pd.DataFrame([total_row], columns=display_df.columns)], ignore_index=True)
 
-# ---------- Gráfico para facturación por mes ----------
+# ---------- Gráfico: facturación por mes ----------
 def show_monthly_facturacion_chart(df: pd.DataFrame, month: int, year: int):
-    """Muestra gráfico de barras por TIPO CLIENTE sumando MONTO PRINCIPAL NETO."""
     if df.empty or "TIPO CLIENTE" not in df.columns or "MONTO PRINCIPAL NETO" not in df.columns:
         return
     g = (df.groupby("TIPO CLIENTE", dropna=False)["MONTO PRINCIPAL NETO"]
@@ -522,8 +533,8 @@ def show_monthly_facturacion_chart(df: pd.DataFrame, month: int, year: int):
     st.bar_chart(g.set_index("TIPO CLIENTE"))
 
 # ---------- UI ----------
-st.title("🔥 Fénix Automotriz — RAG con Meses en español + Fechas estrictas")
-st.caption("Filtrado exacto por mes (ej. 'facturación de marzo [2025]') y, cuando aplica, fechas futuras (≥ hoy).")
+st.title("🔥 Fénix Automotriz — RAG con MES en español (estricto) + Fechas futuras (≥ hoy)")
+st.caption("Si la pregunta especifica mes, se filtra PRIMERO por ese mes y se indexa solo ese subconjunto. Sin mezclas.")
 
 with st.sidebar:
     st.subheader("⚙️ Parámetros")
@@ -540,107 +551,113 @@ if "messages" not in st.session_state: st.session_state.messages=[]
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
 
-question=st.chat_input("Ej.: 'facturación de marzo', 'facturación de marzo 2025', 'entregas en septiembre', 'próximas facturas'…")
+question=st.chat_input("Ej.: 'facturación de marzo 2025', 'entregas de septiembre', 'próximas facturas', 'este mes'…")
 if question:
-    # 1) Intent parser (genérico)
-    llm_filters=llm_parse_intent(question, df)
-    extracted=llm_filters.get("filters", [])
+    # ============= 1) Analizador de MES — PRIMARIO =============
+    month_num, year_num, month_token = parse_explicit_month_year(question)
+    month_mode = month_num is not None
+    used_month_col = None
+    subset_df = pd.DataFrame()
 
-    # 2) Detección explícita de MES (+ año)
-    month_num, year_num = parse_explicit_month_year(question)
-    month_filters=[]; month_mode=False; month_date_col=None
-    if month_num is not None:
-        month_mode=True
-        # Elegimos columna por intención: por defecto facturación; si pregunta "entregas de marzo" usamos FECHA ENTREGA
+    if month_mode:
+        # Seleccionar columna de fecha en función de la intención; por defecto facturación
         if "entreg" in _norm(question) and "FECHA ENTREGA" in df.columns:
-            month_date_col="FECHA ENTREGA"
+            used_month_col="FECHA ENTREGA"
+        elif "pago" in _norm(question) and "FECHA DE PAGO FACTURA" in df.columns:
+            used_month_col="FECHA DE PAGO FACTURA"
         else:
-            month_date_col="FECHA DE FACTURACION" if "FECHA DE FACTURACION" in df.columns else choose_date_column(question, df)
-        if month_date_col:
-            y = year_num if year_num else dt.date.today().year
-            start, end = month_to_range(y, month_num)
-            month_filters.append({"column":month_date_col,"op":"between_dates","value":[start, end]})
+            used_month_col="FECHA DE FACTURACION" if "FECHA DE FACTURACION" in df.columns else choose_date_column(question, df)
 
-    # 3) Reglas de futuro (si NO hay mes explícito)
-    rules=[]
-    def detect_future_intent_local(q: str) -> bool:
-        return detect_future_intent(q)
+        # Año por defecto: actual
+        year_num = year_num if year_num else dt.date.today().year
 
-    strict_future = False
+        # Filtro PRIMARIO por mes (sin fallback, NaT fuera)
+        subset_df = apply_month_filter_first(df, month_num, year_num, used_month_col)
+
+    # ============= 2) Analizador de intenciones (secundario) =============
+    #    Se aplica sobre subset_df si month_mode, sino sobre df
+    base_for_filters = subset_df if month_mode else df
+    llm_filters = llm_parse_intent(question, base_for_filters)
+    extracted = llm_filters.get("filters", [])
+
+    # Reglas de FUTURO (solo si NO hay mes explícito)
     used_date_col = None
-    if not month_mode and detect_future_intent_local(question):
-        rules, used_date_col = [], None  # solo reservamos espacio; aplicamos guardarraíl abajo
+    if not month_mode and detect_future_intent(question):
+        extracted, used_date_col = enforce_future_guardrail(extracted, base_for_filters, question)
 
-    # 4) Mezclamos filtros
-    all_filters = extracted + month_filters + rules
+    # ============= 3) Aplicar filtros exactos (secundarios) =============
+    filtered_df, filter_log = apply_filters(base_for_filters, extracted)
 
-    # 5) Guardarraíl futuro >= HOY (solo si NO estamos en month_mode)
-    if not month_mode:
-        all_filters, used_date_col = enforce_future_guardrail(all_filters, df, question)
+    # Post-filter defensivo por mes (si month_mode): garantiza que nada escape del mes
+    if month_mode and not subset_df.empty and used_month_col in filtered_df.columns:
+        s = filtered_df[used_month_col]
+        if not pd.api.types.is_datetime64_any_dtype(s):
+            s = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        filtered_df = filtered_df[(s.dt.year == year_num) & (s.dt.month == month_num)]
 
-    # 6) Aplicar filtros exactos
-    filtered_df, filter_log = apply_filters(df, all_filters)
-
-    # 6.b Post-filter estricto adicional: si hay futuro (y no month_mode) y tenemos columna, recortar a >= hoy
-    if not month_mode and detect_future_intent_local(question) and used_date_col and used_date_col in filtered_df.columns:
+    # Post-filter defensivo de futuro (si aplica)
+    if not month_mode and detect_future_intent(question) and used_date_col and used_date_col in filtered_df.columns:
         today_ts = pd.to_datetime(dt.date.today())
         s = filtered_df[used_date_col]
         filtered_df = filtered_df[s.isna() | (s >= today_ts)]
 
-    # 7) Subconjunto para indexar:
-    #    - Si month_mode: NO hay fallback al DF completo (evita mezclar otros meses).
-    #    - Si intención futura: NO hay fallback al DF completo.
-    #    - Si ninguno de los dos: sí se permite fallback al DF completo (comportamiento original).
+    # ============= 4) Subconjunto final para indexar =============
+    # - Si month_mode: NO fallback al DF completo (evita mezclar otros meses).
+    # - Si intención futura: NO fallback al DF completo.
+    # - En otros casos, si queda vacío, fallback al DF completo.
     if month_mode:
-        subset_df = filtered_df  # sin fallback
+        final_subset = filtered_df  # estricto al mes
     else:
-        strict_future = detect_future_intent_local(question)
-        subset_df = filtered_df if not filtered_df.empty else (pd.DataFrame() if strict_future else df)
+        if detect_future_intent(question):
+            final_subset = filtered_df  # sin fallback en futuro
+        else:
+            final_subset = filtered_df if not filtered_df.empty else df
 
-    # 8) Índice SOLO con el subconjunto
-    frags, ids = make_fragments(subset_df)
+    # ============= 5) Indexar SOLO el subconjunto final =============
+    frags, ids = make_fragments(final_subset)
     if force_index:
         for k in ["subset_index_hash","subset_collection","subset_embs","subset_ids","subset_docs","subset_backend"]:
             st.session_state.pop(k, None)
     ensure_index(frags, ids)
 
-    # 9) Recuperación SOLO del subconjunto
+    # ============= 6) Recuperación SOLO del subconjunto y respuesta LLM =============
     docs, row_ids = retrieve_top_subset(question, k=top_k)
-
-    # 10) LLM
     answer, prompt_msgs = llm_answer(question, docs)
 
-    # 11) Totales si corresponde
+    # ============= 7) Totales y salida UI =============
     want_totals = requires_totals(question)
-    totals_dict = totals_for_df(subset_df) if want_totals and not subset_df.empty else {}
+    totals_dict = totals_for_df(final_subset) if want_totals and not final_subset.empty else {}
 
-    # Persistir chat
     st.session_state.messages += [{"role":"user","content":question},
                                   {"role":"assistant","content":answer}]
 
     with st.chat_message("assistant"):
         if show_diag:
-            with st.expander("🧭 Diagnóstico (mes / fechas)"):
-                st.markdown("**Filtros LLM:**"); st.json(extracted)
-                st.markdown("**Mes detectado:**"); st.json({"month": month_num, "year": year_num, "date_col": month_date_col})
-                st.markdown("**Filtros de mes:**"); st.json(month_filters)
+            with st.expander("🧭 Diagnóstico (MES / FECHAS)"):
+                st.markdown("**Mes detectado:**"); st.json({"month_num": month_num, "year": year_num, "token": month_token, "date_col": used_month_col})
+                st.markdown("**Filtros del LLM (secundarios):**"); st.json(extracted)
                 if not month_mode:
                     st.markdown("**Guardarraíl futuro (>= hoy):**"); st.json({"used_date_col": used_date_col})
                 st.markdown("**Aplicación secuencial y remanentes:**"); st.json(filter_log)
-                st.markdown(f"**Tamaño del subconjunto usado para indexar:** {len(subset_df)} filas")
+                st.markdown(f"**Tamaño del subconjunto indexado:** {len(final_subset)} filas")
+            with st.expander("🧩 Top-3 fragmentos del subconjunto"):
+                for i, d in enumerate(docs[:3], 1):
+                    st.markdown(f"**Fragmento {i}**\n\n```\n{d}\n```")
+            with st.expander("🧪 Prompt exacto enviado al LLM"):
+                st.write("**System Prompt:**"); st.code(prompt_msgs[0]["content"])
+                st.write("**User Prompt:**"); st.code(prompt_msgs[1]["content"])
 
-        # Mensaje + auditoría
-        if month_mode and subset_df.empty:
+        if month_mode and final_subset.empty:
             st.info("No se encontraron filas para el mes solicitado.")
-        elif not month_mode and detect_future_intent_local(question) and subset_df.empty:
+        elif (not month_mode) and detect_future_intent(question) and final_subset.empty:
             st.info("No se encontraron filas con fechas futuras (≥ hoy) según tu consulta.")
 
         st.markdown(answer)
 
         # Tabla + totales
-        if not subset_df.empty:
-            show_cols=[c for c in CANONICAL_FIELDS if c in subset_df.columns]
-            to_show = subset_df[show_cols] if show_cols else subset_df.copy()
+        if not final_subset.empty:
+            show_cols=[c for c in CANONICAL_FIELDS if c in final_subset.columns]
+            to_show = final_subset[show_cols] if show_cols else final_subset.copy()
             if want_totals:
                 if totals_dict:
                     cols = st.columns(max(1,len(totals_dict)))
@@ -653,17 +670,12 @@ if question:
                                data=to_show.to_csv(index=False).encode("utf-8"),
                                file_name="subconjunto_filtrado.csv", mime="text/csv")
 
-            # 12) Gráfico: si la intención involucra FACTURACIÓN por mes (month_mode y 'factur' en la pregunta)
-            if month_mode and ("factur" in _norm(question)) and ("FECHA DE FACTURACION" in subset_df.columns):
-                # Aseguramos que el subset corresponda al mes detectado; si el filtro fue por otra columna, recortamos aquí.
-                if month_date_col != "FECHA DE FACTURACION" and "FECHA DE FACTURACION" in subset_df.columns:
-                    # Filtramos adicionalmente por el mes/año detectado para el gráfico.
-                    y = year_num if year_num else dt.date.today().year
-                    subset_for_chart = subset_df[
-                        (subset_df["FECHA DE FACTURACION"].dt.year == y) &
-                        (subset_df["FECHA DE FACTURACION"].dt.month == month_num)
-                    ].copy()
-                else:
-                    subset_for_chart = subset_df.copy()
-
-                show_monthly_facturacion_chart(subset_for_chart, month_num, year_num if year_num else dt.date.today().year)
+            # Gráfico: facturación por mes
+            if month_mode and ("factur" in _norm(question)) and ("FECHA DE FACTURACION" in final_subset.columns):
+                year_for_chart = year_num if year_num else dt.date.today().year
+                # Asegurar que el gráfico use SÓLO el mes/año indicados
+                s = final_subset["FECHA DE FACTURACION"]
+                if not pd.api.types.is_datetime64_any_dtype(s):
+                    s = pd.to_datetime(s, errors="coerce", dayfirst=True)
+                subset_for_chart = final_subset[(s.dt.year == year_for_chart) & (s.dt.month == month_num)].copy()
+                show_monthly_facturacion_chart(subset_for_chart, month_num, year_for_chart)
