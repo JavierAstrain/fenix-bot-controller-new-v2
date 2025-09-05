@@ -3,7 +3,8 @@ pandas>=2.1.0
 numpy>=1.26.0
 gspread>=6.0.0
 google-auth>=2.29.0
-chromadb>=0.5.5
+# ChromaDB estable en Py<=3.12. En 3.13 puede fallar: fijamos versión y añadimos fallback en app.py
+chromadb==0.5.5
 openai>=1.40.0
 unidecode>=1.3.8
 plotly>=5.22.0
