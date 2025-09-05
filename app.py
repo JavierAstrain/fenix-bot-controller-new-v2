@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Consulta Nexa IA — Fénix Automotriz
-Refactor UI (marca & UX): login, navegación en sidebar, temas, iconos de chat, soporte, métricas y análisis.
-⚠️ La lógica RAG/filtrado permanece intacta (mismas funciones de carga, normalización, filtros por mes y futuro, indexado y retrieval).
+UI con marca (login, sidebar, iconos chat, métricas, análisis) + manejo robusto de assets.
+⚠️ La lógica RAG/filtrado permanece intacta.
 """
 
 import os, re, json, hashlib, datetime as dt
@@ -18,32 +18,53 @@ from unidecode import unidecode
 from openai import OpenAI
 
 # =========================
-#   CONFIG BÁSICA / ASSETS
+#  ASSETS ROBUSTOS (raíz / assets / /mnt/data)
 # =========================
-
 ASSETS_DIR = "assets"
-def asset(path):
-    # Capa de compatibilidad por si los assets viven en otra ruta
-    cand = os.path.join(ASSETS_DIR, path)
-    if os.path.exists(cand): return cand
-    # Fallbacks típicos (entorno de pruebas)
-    fallback = {
-        "Nexa_logo.png": "/mnt/data/Nexa_logo.png",
-        "Isotipo_Nexa.png": "/mnt/data/Isotipo_Nexa.png",
-        "Fenix_isotipo.png": "/mnt/data/Fenix_isotipo.png",
-        "nexa_favicon.ico": "assets/nexa_favicon.ico"
-    }.get(path)
-    return fallback if (fallback and os.path.exists(fallback)) else cand
 
+def asset(name: str) -> Optional[str]:
+    """
+    Devuelve la primera ruta disponible:
+    - raíz del repo (main)
+    - ./assets
+    - /mnt/data (entorno de pruebas)
+    """
+    candidates = [
+        name,
+        os.path.join(ASSETS_DIR, name),
+        os.path.join("/mnt/data", name),
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+def safe_image(name_or_path: str, **kwargs) -> bool:
+    """
+    Muestra una imagen si existe (sin crashear). Usa use_container_width (no use_column_width).
+    Devuelve True si se mostró.
+    """
+    path = asset(name_or_path) or name_or_path
+    if path and os.path.exists(path):
+        kwargs.pop("use_column_width", None)  # deprecado
+        kwargs.setdefault("use_container_width", True)
+        st.image(path, **kwargs)
+        return True
+    return False
+
+def safe_page_icon(name: str, default="🔥"):
+    p = asset(name)
+    return p if p else default
+
+# =========================
+#   CONFIG BÁSICA / THEMING
+# =========================
 st.set_page_config(
     page_title="Consulta Nexa IA",
-    page_icon=asset("nexa_favicon.ico"),
-    layout="wide"
+    page_icon=safe_page_icon("nexa_favicon.ico"),
+    layout="wide",
 )
 
-# =========================
-#      PALETA / THEMING
-# =========================
 PALETTE = {
     "Nexa Blue": {"primary": "#1e88ff"},
     "Lime": {"primary": "#22c55e"},
@@ -85,9 +106,6 @@ def apply_theme(name: str):
             border-radius: .75rem;
             padding: .25rem .5rem;
         }}
-        header, .css-18ni7ap, .e1ewe7hr3 {{
-            backdrop-filter: blur(6px);
-        }}
         .nexa-topbar {{
             display: flex; align-items:center; justify-content:flex-end;
             gap: 10px;
@@ -100,13 +118,13 @@ def apply_theme(name: str):
         unsafe_allow_html=True
     )
 
-# =========================
-#      ESTADO / LOGIN
-# =========================
 if "theme_name" not in st.session_state:
     st.session_state.theme_name = DEFAULT_THEME
 apply_theme(st.session_state.theme_name)
 
+# =========================
+#      ESTADO / LOGIN
+# =========================
 if "authed" not in st.session_state:
     st.session_state.authed = False
 if "stats" not in st.session_state:
@@ -121,22 +139,26 @@ def check_login(user: str, pwd: str) -> bool:
 def login_view():
     col = st.columns([1,1,1])[1]
     with col:
-        st.image(asset("Nexa_logo.png"), width=180)
+        safe_image("Nexa_logo.png", use_container_width=False, width=180)
         st.markdown("### Acceso")
         u = st.text_input("Usuario", placeholder="Usuario")
         p = st.text_input("Contraseña", type="password", placeholder="••••••••")
         if st.button("Ingresar"):
             if check_login(u, p):
                 st.session_state.authed = True
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Usuario o contraseña inválidos.")
 
 # =========================
 #   LÓGICA RAG (SIN CAMBIOS)
 # =========================
+CHROMA_AVAILABLE = True
+try:
+    import chromadb
+except Exception:
+    CHROMA_AVAILABLE = False
 
-# (Constantes, mapeos y funciones del bot — idénticas a la versión funcional)
 SHEET_ID = "1SaXuzhY_sJ9Tk9MOLDLAI4OVdsNbCP-X4L8cP15yTqo"
 WORKSHEET = "MODELO_BOT"
 
@@ -313,14 +335,8 @@ def embed_texts(client: OpenAI, texts: List[str], model="text-embedding-3-small"
         out.extend([d.embedding for d in resp.data])
     return out
 
-CHROMA_AVAILABLE = True
-try:
-    import chromadb
-except Exception:
-    CHROMA_AVAILABLE = False
-
 def _hash_frags(frags: List[str]) -> str:
-    import hashlib as _h; h=_h.md5()
+    h=hashlib.md5()
     for t in frags: h.update(t.encode("utf-8"))
     return h.hexdigest()
 
@@ -625,14 +641,14 @@ df=normalize_df(raw_df)
 #      SIDEBAR / NAV
 # =========================
 with st.sidebar:
-    st.image(asset("Nexa_logo.png"), use_column_width=True)
+    safe_image("Nexa_logo.png")  # logo en sidebar
     st.markdown("---")
     nav = st.radio("Navegación", ["Consulta IA", "Análisis de negocio", "Configuración", "Diagnóstico y uso", "Soporte"], index=0)
     st.markdown("---")
     if st.session_state.authed:
         if st.button("Cerrar sesión"):
             st.session_state.authed = False
-            st.experimental_rerun()
+            st.rerun()
 
 # =========================
 #          LOGIN
@@ -651,19 +667,16 @@ with c1:
     st.caption("Asistente de análisis para Fénix Automotriz (RAG + filtros exactos)")
 with c2:
     st.markdown('<div class="nexa-topbar">', unsafe_allow_html=True)
-    st.image(asset("Fenix_isotipo.png"), width=72)
+    safe_image("Fenix_isotipo.png", use_container_width=False, width=72)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # =========================
 #         PÁGINAS
 # =========================
-
-# Avatares del chat
-USER_AVATAR = asset("Fenix_isotipo.png")
-BOT_AVATAR  = asset("Isotipo_Nexa.png")
+USER_AVATAR = (asset("Fenix_isotipo.png") or "🛠️")
+BOT_AVATAR  = (asset("Isotipo_Nexa.png") or "🤖")
 
 def estimate_tokens(*texts) -> int:
-    # estimación simple: ~4 caracteres por token
     total_chars = sum(len(t) for t in texts if t)
     return max(1, total_chars // 4)
 
@@ -674,7 +687,6 @@ def page_chat():
         show_diag = st.checkbox("🔎 Mostrar diagnóstico", value=True, key="diag_chat")
         force_index = st.button("🔁 Reindexar subconjunto")
 
-    # Mostrar historial
     if "messages" not in st.session_state: st.session_state.messages=[]
     for m in st.session_state.messages:
         with st.chat_message(m["role"], avatar=(USER_AVATAR if m["role"]=="user" else BOT_AVATAR)):
@@ -684,7 +696,7 @@ def page_chat():
     if not question:
         return
 
-    # ===== Pipeline (idéntico al anterior) =====
+    # ===== Pipeline =====
     # 1) Analizador de MES — PRIMARIO
     month_num, year_num, month_token = parse_explicit_month_year(question)
     month_mode = month_num is not None
@@ -741,11 +753,9 @@ def page_chat():
     docs, row_ids = retrieve_top_subset(question, k=top_k)
     answer, prompt_msgs = llm_answer(question, docs)
 
-    # ===== Métricas de uso (estimación) =====
     st.session_state.stats["queries"] += 1
     st.session_state.stats["tokens_est"] += estimate_tokens(question, *docs, answer)
 
-    # ===== UI Chat =====
     st.session_state.messages += [{"role":"user","content":question},
                                   {"role":"assistant","content":answer}]
 
@@ -785,8 +795,7 @@ def page_analytics():
         if date_col in df.columns:
             subset = apply_month_filter_first(df, month_num, int(year), date_col)
             st.dataframe(subset, use_container_width=True, hide_index=True)
-            if "FECHA DE FACTURACION" in subset.columns and metric in subset.columns:
-                # Gráfico por TIPO CLIENTE (manteniendo la función existente para facturación neta)
+            if "TIPO CLIENTE" in subset.columns and metric in subset.columns:
                 st.markdown("---")
                 st.markdown("#### Facturación por TIPO CLIENTE")
                 agg=(subset.groupby("TIPO CLIENTE", dropna=False)[metric]
@@ -831,11 +840,14 @@ def page_support():
     st.markdown("Para ayuda y soporte técnico:")
     st.markdown("- **Correo:** soporte@nexa.cl")
     st.markdown("- **Web:** www.nexa.cl")
-    st.image(asset("Nexa_logo.png"), width=180)
+    safe_image("Nexa_logo.png", use_container_width=False, width=180)
 
 # =========================
 #      ROUTER DE PÁGINA
 # =========================
+with st.sidebar:
+    nav = nav  # ya definido antes
+
 if nav == "Consulta IA":
     page_chat()
 elif nav == "Análisis de negocio":
