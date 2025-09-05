@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Fénix Automotriz — Agente de Negocio (RAG) en Streamlit
-Fix2: Detección robusta de credenciales en st.secrets.
-- Busca credenciales bajo múltiples claves posibles (gcp_service_account, service_account, etc.).
-- Si no encuentra, muestra las claves disponibles en st.secrets (solo nombres) para guiar.
-- Mantiene fallback si ChromaDB no está disponible.
+Fix4: Hibridación semántica + filtros deterministas (Pandas) para respuestas NUMÉRICAS correctas.
+- Interpreta consultas comunes ("sin facturar", "entregados", meses, rangos de fechas, etc.)
+- Aplica filtros sobre el DataFrame y calcula métricas (conteos/sumas/promedios)
+- Luego usa RAG (Chroma o fallback) solo para contexto textual y explicación con LLM
 """
 import os, re, json, hashlib
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -17,7 +17,6 @@ from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from unidecode import unidecode
 
-# --- Intentar importar ChromaDB ---
 CHROMA_AVAILABLE = True
 try:
     import chromadb
@@ -86,18 +85,8 @@ NUMERIC_FIELDS_CANDIDATES = [
     "NUMERO DE DIAS EN PLANTA","DIAS EN DOMINIO","CANTIDAD DE VEHICULO","DIAS DE PAGO DE FACTURA",
 ]
 
-# ------------- Credenciales -------------
+# ---------------- Credenciales Google ----------------
 def _try_load_sa_from_secrets() -> Dict:
-    """
-    Soporta varias formas de cargar el service account:
-    - st.secrets['gcp_service_account']          (dict TOML)
-    - st.secrets['service_account']              (dict TOML)
-    - st.secrets['google_service_account']       (dict TOML)
-    - st.secrets['gcp_service_account_json']     (str JSON)
-    - st.secrets['GOOGLE_CREDENTIALS_JSON']      (str JSON)
-    - env GOOGLE_CREDENTIALS_JSON / GOOGLE_APPLICATION_CREDENTIALS_JSON (str JSON)
-    """
-    # Dicts directos
     for key in ["gcp_service_account", "service_account", "google_service_account"]:
         try:
             obj = st.secrets[key]
@@ -105,19 +94,24 @@ def _try_load_sa_from_secrets() -> Dict:
                 return dict(obj)
         except Exception:
             pass
-    # Strings JSON
-    for key in ["gcp_service_account_json", "GOOGLE_CREDENTIALS_JSON"]:
+    for key in [
+        "gcp_service_account_json",
+        "GOOGLE_CREDENTIALS_JSON",
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+        "GOOGLE_CREDENTIALS",
+        "GCP_CREDENTIALS_JSON",
+        "SERVICE_ACCOUNT_JSON",
+    ]:
         try:
-            s = st.secrets[key]
-            if isinstance(s, str) and s.strip().startswith("{"):
+            s = st.secrets.get(key, "")
+            if isinstance(s, str) and "{" in s and "}" in s:
                 return json.loads(s)
         except Exception:
             pass
-    # ENV JSON
-    for key in ["GOOGLE_CREDENTIALS_JSON", "GOOGLE_APPLICATION_CREDENTIALS_JSON"]:
+    for key in ["GOOGLE_CREDENTIALS_JSON", "GOOGLE_APPLICATION_CREDENTIALS_JSON", "GOOGLE_CREDENTIALS"]:
         try:
             s = os.getenv(key, "")
-            if s.strip().startswith("{"):
+            if isinstance(s, str) and "{" in s and "}" in s:
                 return json.loads(s)
         except Exception:
             pass
@@ -125,7 +119,7 @@ def _try_load_sa_from_secrets() -> Dict:
 
 def _secrets_keys_safe():
     try:
-        return list(st.secrets._secrets.keys())  # tipo privado, pero solo nombres
+        return list(st.secrets._secrets.keys())
     except Exception:
         try:
             return list(st.secrets.keys())
@@ -142,7 +136,6 @@ def get_gspread_client():
     creds = Credentials.from_service_account_info(service_info, scopes=scopes)
     return gspread.authorize(creds)
 
-# ------------- Utilidades -------------
 def norm_text(s: str) -> str:
     s = unidecode(str(s)).lower().strip()
     s = re.sub(r"[\[\]\(\)]+", "", s)
@@ -152,7 +145,8 @@ def norm_text(s: str) -> str:
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = {}
     for c in df.columns:
-        key = norm_text(c); mapped = NORMALIZATION_MAP.get(key)
+        key = norm_text(c)
+        mapped = NORMALIZATION_MAP.get(key)
         if mapped: new_cols[c] = mapped
     return df.rename(columns=new_cols)
 
@@ -164,6 +158,11 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].astype(str).str.replace(r"[.$ ]", "", regex=True).str.replace(",", ".", regex=True)
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    # normalizar FACTURADO (string)
+    if "FACTURADO" in df.columns:
+        df["FACTURADO"] = df["FACTURADO"].astype(str).str.strip().str.upper().replace({
+            "TRUE":"SI","FALSE":"NO","1":"SI","0":"NO"
+        })
     return df
 
 def build_fragments(df: pd.DataFrame) -> pd.DataFrame:
@@ -207,12 +206,11 @@ def embed_texts(client: OpenAI, texts: List[str], model: str = "text-embedding-3
         out.extend([d.embedding for d in resp.data])
     return out
 
-# ---------------- Chroma o Fallback ----------------
+# ------------- Backend vectorial -------------
 def ensure_index(df: pd.DataFrame):
     current_hash = hash_dataframe(df)
     if "index_hash" not in st.session_state or st.session_state.index_hash != current_hash:
         st.session_state.index_hash = None
-
     if CHROMA_AVAILABLE:
         client = chromadb.PersistentClient(path="./.chroma")
         coll_name = f"fenix_modelo_bot_{current_hash[:10]}"
@@ -239,8 +237,7 @@ def ensure_index(df: pd.DataFrame):
             ids = df["__row_id__"].tolist()
             with st.spinner("Construyendo índice vectorial (fallback)…"):
                 embs = np.array(embed_texts(openai_client, docs), dtype=np.float32)
-            import numpy as _np
-            _np.savez(cache_file, embs=embs, ids=_np.array(ids, dtype=object), docs=_np.array(docs, dtype=object))
+            np.savez(cache_file, embs=embs, ids=np.array(ids, dtype=object), docs=np.array(docs, dtype=object))
         data = np.load(cache_file, allow_pickle=True)
         st.session_state.simple_embs = data["embs"]
         st.session_state.simple_ids = data["ids"].tolist()
@@ -248,7 +245,7 @@ def ensure_index(df: pd.DataFrame):
         st.session_state.index_hash = current_hash
         st.session_state.index_backend = "simple"
 
-def retrieve_top_k(query: str, k: int = 8):
+def retrieve_top_k(query: str, k: int = 12):
     if st.session_state.index_backend == "chroma":
         client = get_openai_client()
         q_emb = embed_texts(client, [query])[0]
@@ -268,28 +265,152 @@ def retrieve_top_k(query: str, k: int = 8):
         metas = [{"row_id": st.session_state.simple_ids[i]} for i in idx]
         return docs, metas
 
-def build_prompt(context_chunks: List[str], question: str) -> str:
+# ------------- Intérprete de consultas (filtros deterministas) -------------
+SP_MONTHS = {
+    "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
+}
+
+def parse_date_mentions(q: str) -> Tuple[pd.Timestamp, pd.Timestamp, str]:
+    """Devuelve (start, end, label) si detecta un mes/rango; si no, (None,None,"")."""
+    ql = unidecode(q).lower()
+    # Rango explícito dd/mm/yyyy - dd/mm/yyyy
+    m = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}).{0,10}(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", ql)
+    if m:
+        s = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce")
+        e = pd.to_datetime(m.group(2), dayfirst=True, errors="coerce")
+        if pd.notna(s) and pd.notna(e):
+            return s, e, f"entre {s.date()} y {e.date()}"
+    # Mes + año
+    for name, num in SP_MONTHS.items():
+        if name in ql:
+            # ¿año?
+            m2 = re.search(rf"{name}\s+(\d{{4}})", ql)
+            if m2:
+                y = int(m2.group(1))
+            else:
+                y = pd.Timestamp.today().year
+            start = pd.Timestamp(year=y, month=num, day=1)
+            end = (start + pd.offsets.MonthEnd(0))
+            return start, end, f"{name.capitalize()} {y}"
+    # Este mes / mes pasado
+    if "este mes" in ql or "actual" in ql:
+        today = pd.Timestamp.today()
+        start = pd.Timestamp(year=today.year, month=today.month, day=1)
+        end = (start + pd.offsets.MonthEnd(0))
+        return start, end, "este mes"
+    if "mes pasado" in ql or "ultimo mes" in ql or "último mes" in ql:
+        today = pd.Timestamp.today() - pd.offsets.MonthBegin(1)
+        start = pd.Timestamp(year=today.year, month=today.month, day=1)
+        end = (start + pd.offsets.MonthEnd(0))
+        return start, end, "mes pasado"
+    return None, None, ""
+
+def build_mask(df: pd.DataFrame, q: str) -> Tuple[pd.Series, Dict]:
+    """Devuelve (mask, info) con filtros aplicados y metadatos para debug."""
+    qn = unidecode(q).lower()
+    mask = pd.Series(True, index=df.index)
+    info = {}
+
+    # Sin facturar
+    if any(k in qn for k in ["sin factur", "no factur", "no facturados", "pendiente de factur"]):
+        info["sin_factura"] = True
+        m1 = df["NUMERO DE FACTURA"].astype(str).str.strip().isin(["", "nan", "None", "0"]) if "NUMERO DE FACTURA" in df.columns else True
+        m2 = df["FACTURADO"].astype(str).str.upper().isin(["NO", "PENDIENTE", "NAN"]) if "FACTURADO" in df.columns else True
+        mask &= (m1 | m2)
+
+    # Entregados
+    if any(k in qn for k in ["entregado", "entregados"]):
+        if "FECHA ENTREGA" in df.columns:
+            info["entregados"] = True
+            mask &= df["FECHA ENTREGA"].notna()
+
+    # En planta
+    if "en planta" in qn or "dias en planta" in qn or "días en planta" in qn:
+        if "NUMERO DE DIAS EN PLANTA" in df.columns:
+            info["en_planta"] = True
+            # si pide umbrales: >, <, >=, <= N
+            m = re.search(r"(?:>=|<=|>|<)\s*(\d+)", qn)
+            if m:
+                val = int(m.group(1))
+                if ">=" in qn: mask &= (df["NUMERO DE DIAS EN PLANTA"] >= val)
+                elif "<=" in qn: mask &= (df["NUMERO DE DIAS EN PLANTA"] <= val)
+                elif ">" in qn: mask &= (df["NUMERO DE DIAS EN PLANTA"] > val)
+                elif "<" in qn: mask &= (df["NUMERO DE DIAS EN PLANTA"] < val)
+
+    # Por mes/rango usando fechas de facturación si habla de facturas; sino recepción
+    ds, de, label = parse_date_mentions(q)
+    if ds is not None and de is not None:
+        info["periodo"] = label
+        date_col = "FECHA DE FACTURACION" if "factur" in qn else ("FECHA RECEPCION" if "recepcion" in qn or "recepción" in qn else None)
+        if date_col is None:
+            # fallback: preferimos FECHA DE FACTURACION y si no existe, FECHA INGRESO PLANTA
+            date_col = "FECHA DE FACTURACION" if "FECHA DE FACTURACION" in df.columns else "FECHA INGRESO PLANTA"
+        if date_col in df.columns:
+            mask &= df[date_col].between(ds, de)
+
+    # Por patente específica
+    mpat = re.search(r"\b([A-Z]{2,3}-?\d{2,3})\b", q.upper())
+    if mpat and "PATENTE" in df.columns:
+        info["patente"] = mpat.group(1)
+        mask &= df["PATENTE"].astype(str).str.upper().str.replace("-", "") == info["patente"].replace("-", "")
+
+    return mask, info
+
+def compute_metrics(df: pd.DataFrame) -> Dict:
+    out = {"cantidad": len(df)}
+    if "MONTO PRINCIPAL BRUTO [F]" in df.columns:
+        out["monto_bruto"] = float(df["MONTO PRINCIPAL BRUTO [F]"].fillna(0).sum())
+    if "MONTO PRINCIPAL NETO" in df.columns:
+        out["monto_neto"] = float(df["MONTO PRINCIPAL NETO"].fillna(0).sum())
+    if "IVA PRINCIPAL [F]" in df.columns:
+        out["iva"] = float(df["IVA PRINCIPAL [F]"].fillna(0).sum())
+    if "NUMERO DE DIAS EN PLANTA" in df.columns:
+        col = df["NUMERO DE DIAS EN PLANTA"].dropna()
+        if not col.empty:
+            out["dias_planta_prom"] = float(col.mean())
+            out["dias_planta_p95"] = float(col.quantile(0.95))
+    return out
+
+def metrics_to_text(m: Dict) -> str:
+    if not m: return ""
+    parts = [f"- Registros: {m.get('cantidad', 0):,.0f}"]
+    if "monto_bruto" in m: parts.append(f"- Monto bruto: ${m['monto_bruto']:,.0f}".replace(",", "."))
+    if "monto_neto" in m: parts.append(f"- Monto neto: ${m['monto_neto']:,.0f}".replace(",", "."))
+    if "iva" in m: parts.append(f"- IVA: ${m['iva']:,.0f}".replace(",", "."))
+    if "dias_planta_prom" in m: parts.append(f"- Días en planta (prom): {m['dias_planta_prom']:.1f}")
+    if "dias_planta_p95" in m: parts.append(f"- Días en planta (p95): {m['dias_planta_p95']:.1f}")
+    return "\n".join(parts)
+
+# ------------- Prompting -------------
+def build_prompt(context_chunks: List[str], question: str, metrics_text: str, filters_info: Dict) -> str:
     ctx = "\n\n".join([f"- {c}" for c in context_chunks if c])
+    filtros = ", ".join([f"{k}: {v}" for k, v in filters_info.items()]) if filters_info else "—"
     return f"""
-    Eres un agente de negocio experto para Fénix Automotriz. Responde SIEMPRE en español,
-    con precisión, claridad y espíritu analítico, usando EXCLUSIVAMENTE la información de los fragmentos recuperados (Contexto).
-    Si la respuesta no está en los datos, indícalo explícitamente y sugiere qué información faltaría.
+    Eres un analista de negocio de Fénix Automotriz. Responde SIEMPRE en español y
+    **usa los siguientes MÉTRICOS ya calculados** como verdad de referencia. No los contradigas.
 
-    Además, considera el siguiente contexto de negocio (no inventes datos):
-    {BUSINESS_CONTEXT}
+    Filtros aplicados (deterministas sobre DataFrame): {filtros}
+    Métricos calculados:
+    {metrics_text or '—'}
 
-    Contexto recuperado:
+    Usa el siguiente contexto (muestras de registros) solo para enriquecer y ejemplificar, no para cambiar los totales:
     {ctx}
 
     Pregunta del usuario:
     {question}
+
+    Instrucciones:
+    - Da respuesta directa con los totales y, si corresponde, agrega insights, riesgos y recomendaciones.
+    - Si no hay registros para el filtro, dilo y sugiere alternativas.
+    - Sé claro y breve, con bullets cuando ayude.
     """.strip()
 
-def llm_answer(question: str, context_chunks: List[str]) -> str:
+def llm_answer(question: str, context_chunks: List[str], metrics_text: str, filters_info: Dict) -> str:
     client = get_openai_client()
     messages = [
-        {"role": "system", "content": "Eres un analista de negocio senior. Respondes en español, con precisión y foco en decisiones."},
-        {"role": "user", "content": build_prompt(context_chunks, question)},
+        {"role": "system", "content": "Eres un analista financiero/operacional senior. Respondes en español con precisión."},
+        {"role": "user", "content": build_prompt(context_chunks, question, metrics_text, filters_info)},
     ]
     with st.spinner("Generando respuesta con LLM…"):
         resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.2)
@@ -341,12 +462,15 @@ def auto_visualize(df_rows: pd.DataFrame, question: str):
 
 # ---------------- UI ----------------
 st.title("🔥 Fénix Automotriz — Agente de Negocio (RAG)")
-st.caption("Google Sheets → Recuperación semántica → LLM (con fallback y credenciales robustas)")
+st.caption("Google Sheets → Filtros deterministas + Recuperación semántica → LLM")
 
 with st.sidebar:
     st.subheader("⚙️ Parámetros")
-    top_k = st.slider("Máx. fragmentos a recuperar", 3, 15, 8, 1)
+    top_k = st.slider("Máx. fragmentos a recuperar (contexto)", 6, 30, 12, 1)
     force_reindex = st.button("🔁 Reconstruir índice")
+    st.markdown("---")
+    st.subheader("🧪 Debug")
+    show_debug = st.checkbox("Mostrar detalles de filtros y métricas", value=False)
     st.markdown("---")
     st.subheader("📦 Estado")
     st.write("Backend vectorial: **{}**".format("Chroma" if CHROMA_AVAILABLE else "Fallback simple"))
@@ -367,17 +491,46 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-question = st.chat_input("Haz tu pregunta (ej.: vehículos facturados por mes, días en planta, etc.)")
+question = st.chat_input("Haz tu pregunta (p. ej.: 'vehículos entregados no facturados en agosto 2024', 'promedio días en planta > 15', 'monto facturado este mes')")
 if question:
-    docs, metas = retrieve_top_k(question, k=top_k)
-    row_indices = [int(m.get("row_id","0")) for m in metas if "row_id" in m]
-    sel = df.iloc[row_indices].copy() if row_indices else pd.DataFrame()
-    answer = llm_answer(question, docs)
+    # 1) Filtros deterministas
+    mask, finfo = build_mask(df, question)
+    filtered = df[mask].copy()
+    metrics = compute_metrics(filtered)
+    metrics_text = metrics_to_text(metrics)
+
+    # 2) Contexto: usa fragmentos de la muestra filtrada si hay; si no, RAG puro
+    if not filtered.empty:
+        sample = filtered.sample(min(len(filtered), top_k), random_state=42)
+        docs = sample["__fragment__"].tolist()
+        metas = [{"row_id": rid} for rid in sample["__row_id__"].tolist()]
+        row_indices = sample.index.tolist()
+    else:
+        docs, metas = retrieve_top_k(question, k=top_k)
+        row_indices = [int(m.get("row_id","0")) for m in metas if "row_id" in m]
+
+    sel = df.loc[row_indices].copy() if row_indices else pd.DataFrame()
+
+    # 3) Responder
+    answer = llm_answer(question, docs, metrics_text, finfo)
     st.session_state.messages += [{"role":"user","content":question},{"role":"assistant","content":answer}]
+
     with st.chat_message("assistant"):
+        if show_debug:
+            with st.expander("🔎 Filtros aplicados / Métricas"):
+                st.write(finfo)
+                st.code(metrics_text or "—")
         st.markdown(answer)
-        if not sel.empty:
-            show_cols = [c for c in CANONICAL_FIELDS if c in sel.columns]
+
+        # Tabla y gráficos
+        base_to_show = filtered if not filtered.empty else sel
+        if not base_to_show.empty:
             st.markdown("**Registros relevantes (MODELO_BOT):**")
-            st.dataframe(sel[show_cols] if show_cols else sel, use_container_width=True, hide_index=True)
-            auto_visualize(sel, question)
+            show_cols = [c for c in CANONICAL_FIELDS if c in base_to_show.columns]
+            st.dataframe(base_to_show[show_cols] if show_cols else base_to_show, use_container_width=True, hide_index=True)
+            auto_visualize(base_to_show, question)
+            st.download_button("⬇️ Descargar registros (CSV)",
+                data=base_to_show.to_csv(index=False).encode("utf-8"),
+                file_name="registros_filtrados.csv", mime="text/csv")
+        else:
+            st.info("No se encontraron registros para esos criterios.")
