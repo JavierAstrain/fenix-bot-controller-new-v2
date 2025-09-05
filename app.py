@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Fénix Automotriz — Agente de Negocio (RAG) en Streamlit
-Versión con fallback si ChromaDB no está disponible (p. ej., entornos Python 3.13).
-- Intenta usar ChromaDB (Persistente). Si falla la importación, usa un índice simple en memoria
-  con similitud coseno (NumPy), persistiendo a disco como .npz para acelerar siguientes cargas.
+Fix2: Detección robusta de credenciales en st.secrets.
+- Busca credenciales bajo múltiples claves posibles (gcp_service_account, service_account, etc.).
+- Si no encuentra, muestra las claves disponibles en st.secrets (solo nombres) para guiar.
+- Mantiene fallback si ChromaDB no está disponible.
 """
 import os, re, json, hashlib
 from typing import List, Dict
@@ -20,7 +21,7 @@ from unidecode import unidecode
 CHROMA_AVAILABLE = True
 try:
     import chromadb
-except Exception as e:
+except Exception:
     CHROMA_AVAILABLE = False
 
 st.set_page_config(page_title="Fénix | Agente de Negocio (RAG)", page_icon="🔥", layout="wide")
@@ -85,6 +86,63 @@ NUMERIC_FIELDS_CANDIDATES = [
     "NUMERO DE DIAS EN PLANTA","DIAS EN DOMINIO","CANTIDAD DE VEHICULO","DIAS DE PAGO DE FACTURA",
 ]
 
+# ------------- Credenciales -------------
+def _try_load_sa_from_secrets() -> Dict:
+    """
+    Soporta varias formas de cargar el service account:
+    - st.secrets['gcp_service_account']          (dict TOML)
+    - st.secrets['service_account']              (dict TOML)
+    - st.secrets['google_service_account']       (dict TOML)
+    - st.secrets['gcp_service_account_json']     (str JSON)
+    - st.secrets['GOOGLE_CREDENTIALS_JSON']      (str JSON)
+    - env GOOGLE_CREDENTIALS_JSON / GOOGLE_APPLICATION_CREDENTIALS_JSON (str JSON)
+    """
+    # Dicts directos
+    for key in ["gcp_service_account", "service_account", "google_service_account"]:
+        try:
+            obj = st.secrets[key]
+            if isinstance(obj, dict) and "client_email" in obj and "private_key" in obj:
+                return dict(obj)
+        except Exception:
+            pass
+    # Strings JSON
+    for key in ["gcp_service_account_json", "GOOGLE_CREDENTIALS_JSON"]:
+        try:
+            s = st.secrets[key]
+            if isinstance(s, str) and s.strip().startswith("{"):
+                return json.loads(s)
+        except Exception:
+            pass
+    # ENV JSON
+    for key in ["GOOGLE_CREDENTIALS_JSON", "GOOGLE_APPLICATION_CREDENTIALS_JSON"]:
+        try:
+            s = os.getenv(key, "")
+            if s.strip().startswith("{"):
+                return json.loads(s)
+        except Exception:
+            pass
+    return {}
+
+def _secrets_keys_safe():
+    try:
+        return list(st.secrets._secrets.keys())  # tipo privado, pero solo nombres
+    except Exception:
+        try:
+            return list(st.secrets.keys())
+        except Exception:
+            return []
+
+def get_gspread_client():
+    service_info = _try_load_sa_from_secrets()
+    if not service_info:
+        st.error("Faltan credenciales de Google Service Account. Claves de secrets presentes: **{}**"
+                 .format(", ".join(_secrets_keys_safe())))
+        st.stop()
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = Credentials.from_service_account_info(service_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+# ------------- Utilidades -------------
 def norm_text(s: str) -> str:
     s = unidecode(str(s)).lower().strip()
     s = re.sub(r"[\[\]\(\)]+", "", s)
@@ -94,10 +152,8 @@ def norm_text(s: str) -> str:
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = {}
     for c in df.columns:
-        key = norm_text(c)
-        mapped = NORMALIZATION_MAP.get(key)
-        if mapped:
-            new_cols[c] = mapped
+        key = norm_text(c); mapped = NORMALIZATION_MAP.get(key)
+        if mapped: new_cols[c] = mapped
     return df.rename(columns=new_cols)
 
 def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
@@ -106,11 +162,7 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True, infer_datetime_format=True)
     for col in NUMERIC_FIELDS_CANDIDATES:
         if col in df.columns:
-            df[col] = (
-                df[col].astype(str)
-                .str.replace(r"[.$ ]", "", regex=True)
-                .str.replace(",", ".", regex=True)
-            )
+            df[col] = df[col].astype(str).str.replace(r"[.$ ]", "", regex=True).str.replace(",", ".", regex=True)
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
@@ -125,14 +177,7 @@ def build_fragments(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_sheet_dataframe() -> pd.DataFrame:
-    try:
-        service_info = dict(st.secrets["gcp_service_account"])
-    except Exception:
-        st.error("Faltan credenciales en st.secrets['gcp_service_account'].")
-        st.stop()
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    creds = Credentials.from_service_account_info(service_info, scopes=scopes)
-    gc = gspread.authorize(creds)
+    gc = get_gspread_client()
     ws = gc.open_by_key(SHEET_ID).worksheet(WORKSHEET)
     records = ws.get_all_records()
     df = pd.DataFrame(records) if records else pd.DataFrame()
@@ -166,17 +211,15 @@ def embed_texts(client: OpenAI, texts: List[str], model: str = "text-embedding-3
 def ensure_index(df: pd.DataFrame):
     current_hash = hash_dataframe(df)
     if "index_hash" not in st.session_state or st.session_state.index_hash != current_hash:
-        st.session_state.index_hash = None  # invalida
+        st.session_state.index_hash = None
 
     if CHROMA_AVAILABLE:
-        # Chroma persistente
         client = chromadb.PersistentClient(path="./.chroma")
         coll_name = f"fenix_modelo_bot_{current_hash[:10]}"
         try:
             collection = client.get_collection(coll_name)
         except Exception:
             collection = client.get_or_create_collection(coll_name)
-            # poblar colección
             openai_client = get_openai_client()
             docs = df["__fragment__"].fillna("").astype(str).tolist()
             ids = df["__row_id__"].tolist()
@@ -188,7 +231,6 @@ def ensure_index(df: pd.DataFrame):
         st.session_state.index_backend = "chroma"
         st.session_state.collection = collection
     else:
-        # Fallback simple: guardamos embeddings en .cache
         os.makedirs("./.cache", exist_ok=True)
         cache_file = f"./.cache/simple_index_{current_hash}.npz"
         if not os.path.exists(cache_file):
@@ -197,7 +239,8 @@ def ensure_index(df: pd.DataFrame):
             ids = df["__row_id__"].tolist()
             with st.spinner("Construyendo índice vectorial (fallback)…"):
                 embs = np.array(embed_texts(openai_client, docs), dtype=np.float32)
-            np.savez(cache_file, embs=embs, ids=np.array(ids, dtype=object), docs=np.array(docs, dtype=object))
+            import numpy as _np
+            _np.savez(cache_file, embs=embs, ids=_np.array(ids, dtype=object), docs=_np.array(docs, dtype=object))
         data = np.load(cache_file, allow_pickle=True)
         st.session_state.simple_embs = data["embs"]
         st.session_state.simple_ids = data["ids"].tolist()
@@ -217,7 +260,6 @@ def retrieve_top_k(query: str, k: int = 8):
         client = get_openai_client()
         q_emb = np.array(embed_texts(client, [query])[0], dtype=np.float32)
         A = st.session_state.simple_embs
-        # cos sim
         qn = q_emb / (np.linalg.norm(q_emb) + 1e-9)
         An = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-9)
         sims = (An @ qn).ravel()
@@ -233,7 +275,7 @@ def build_prompt(context_chunks: List[str], question: str) -> str:
     con precisión, claridad y espíritu analítico, usando EXCLUSIVAMENTE la información de los fragmentos recuperados (Contexto).
     Si la respuesta no está en los datos, indícalo explícitamente y sugiere qué información faltaría.
 
-    Además, considera el siguiente contexto de negocio para enriquecer el tono y las recomendaciones (no inventes datos):
+    Además, considera el siguiente contexto de negocio (no inventes datos):
     {BUSINESS_CONTEXT}
 
     Contexto recuperado:
@@ -241,11 +283,6 @@ def build_prompt(context_chunks: List[str], question: str) -> str:
 
     Pregunta del usuario:
     {question}
-
-    Instrucciones de estilo:
-    - Respuesta directa y accionable.
-    - Incluir KPIs y recomendaciones cuando aplique.
-    - No inventar información fuera del contexto.
     """.strip()
 
 def llm_answer(question: str, context_chunks: List[str]) -> str:
@@ -304,26 +341,25 @@ def auto_visualize(df_rows: pd.DataFrame, question: str):
 
 # ---------------- UI ----------------
 st.title("🔥 Fénix Automotriz — Agente de Negocio (RAG)")
-st.caption("Google Sheets → Recuperación semántica → LLM (con fallback si Chroma no está disponible)")
+st.caption("Google Sheets → Recuperación semántica → LLM (con fallback y credenciales robustas)")
 
 with st.sidebar:
     st.subheader("⚙️ Parámetros")
     top_k = st.slider("Máx. fragmentos a recuperar", 3, 15, 8, 1)
     force_reindex = st.button("🔁 Reconstruir índice")
-
     st.markdown("---")
-    st.subheader("📦 Estado del backend vectorial")
-    st.write("Disponible ChromaDB: **{}**".format("Sí" if CHROMA_AVAILABLE else "No"))
+    st.subheader("📦 Estado")
+    st.write("Backend vectorial: **{}**".format("Chroma" if CHROMA_AVAILABLE else "Fallback simple"))
 
 if "messages" not in st.session_state: st.session_state.messages = []
+if force_reindex:
+    for k in ["index_hash","collection","simple_embs","simple_ids","simple_docs"]:
+        st.session_state.pop(k, None)
+
 df = load_sheet_dataframe()
 if df.empty:
     st.warning("La hoja MODELO_BOT no tiene registros o no se pudo leer.")
     st.stop()
-
-if force_reindex:
-    for k in ["index_hash","collection","simple_embs","simple_ids","simple_docs"]:
-        st.session_state.pop(k, None)
 
 ensure_index(df)
 
