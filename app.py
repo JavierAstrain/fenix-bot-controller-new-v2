@@ -1,13 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Fénix Automotriz — Agente de Negocio (RAG Híbrido)
-MEJORA: Analizador de intenciones robusto para MES en español (enero..diciembre)
-- Si la pregunta especifica un MES (y opcionalmente AÑO), se aplica PRIMERO un filtro estricto por ese mes.
-- El índice vectorial SIEMPRE se construye sobre ese subconjunto mensual (sin mezclar otros meses).
-- Compatibilidad con guardarraíl de futuro (>= hoy) cuando NO hay mes explícito.
-- Mantiene: filtros robustos, OT “Sin asignar”, totales y gráfico por TIPO CLIENTE.
-
-Requiere: streamlit, pandas, numpy, gspread, google-auth, openai, (chromadb opcional)
+Consulta Nexa IA — Fénix Automotriz
+Refactor UI (marca & UX): login, navegación en sidebar, temas, iconos de chat, soporte, métricas y análisis.
+⚠️ La lógica RAG/filtrado permanece intacta (mismas funciones de carga, normalización, filtros por mes y futuro, indexado y retrieval).
 """
 
 import os, re, json, hashlib, datetime as dt
@@ -22,16 +17,126 @@ from google.oauth2.service_account import Credentials
 from unidecode import unidecode
 from openai import OpenAI
 
-# Vector DB opcional
-CHROMA_AVAILABLE = True
-try:
-    import chromadb
-except Exception:
-    CHROMA_AVAILABLE = False
+# =========================
+#   CONFIG BÁSICA / ASSETS
+# =========================
 
-st.set_page_config(page_title="Fénix | Agente (Meses + Fechas estrictas)", page_icon="🔥", layout="wide")
+ASSETS_DIR = "assets"
+def asset(path):
+    # Capa de compatibilidad por si los assets viven en otra ruta
+    cand = os.path.join(ASSETS_DIR, path)
+    if os.path.exists(cand): return cand
+    # Fallbacks típicos (entorno de pruebas)
+    fallback = {
+        "Nexa_logo.png": "/mnt/data/Nexa_logo.png",
+        "Isotipo_Nexa.png": "/mnt/data/Isotipo_Nexa.png",
+        "Fenix_isotipo.png": "/mnt/data/Fenix_isotipo.png",
+        "nexa_favicon.ico": "assets/nexa_favicon.ico"
+    }.get(path)
+    return fallback if (fallback and os.path.exists(fallback)) else cand
 
-# ---------- Constantes ----------
+st.set_page_config(
+    page_title="Consulta Nexa IA",
+    page_icon=asset("nexa_favicon.ico"),
+    layout="wide"
+)
+
+# =========================
+#      PALETA / THEMING
+# =========================
+PALETTE = {
+    "Nexa Blue": {"primary": "#1e88ff"},
+    "Lime": {"primary": "#22c55e"},
+    "Fénix Orange": {"primary": "#ff6a00"},
+    "Teal": {"primary": "#14b8a6"},
+    "Violet": {"primary": "#8b5cf6"},
+    "Crimson": {"primary": "#ef4444"},
+    "Slate": {"primary": "#475569"},
+}
+DEFAULT_THEME = "Nexa Blue"
+
+def apply_theme(name: str):
+    colors = PALETTE.get(name, PALETTE[DEFAULT_THEME])
+    primary = colors["primary"]
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+            --nexa-primary: {primary};
+        }}
+        .stButton>button {{
+            background-color: var(--nexa-primary) !important;
+            color: white !important;
+            border-radius: .6rem;
+            border: 0;
+        }}
+        .stDownloadButton>button {{
+            background-color: var(--nexa-primary) !important;
+            color: white !important;
+            border-radius: .6rem;
+            border: 0;
+        }}
+        .stTextInput>div>div>input, .stSelectbox>div>div>select, .stNumberInput input {{
+            border: 1px solid {primary}33 !important;
+            border-radius: .5rem !important;
+        }}
+        .stMetric>div>div {{
+            background: {primary}0D; 
+            border-radius: .75rem;
+            padding: .25rem .5rem;
+        }}
+        header, .css-18ni7ap, .e1ewe7hr3 {{
+            backdrop-filter: blur(6px);
+        }}
+        .nexa-topbar {{
+            display: flex; align-items:center; justify-content:flex-end;
+            gap: 10px;
+        }}
+        .nexa-footer {{
+            text-align:center; opacity:.7; padding: 24px 0;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+# =========================
+#      ESTADO / LOGIN
+# =========================
+if "theme_name" not in st.session_state:
+    st.session_state.theme_name = DEFAULT_THEME
+apply_theme(st.session_state.theme_name)
+
+if "authed" not in st.session_state:
+    st.session_state.authed = False
+if "stats" not in st.session_state:
+    st.session_state.stats = {"queries": 0, "tokens_est": 0}
+
+def check_login(user: str, pwd: str) -> bool:
+    try:
+        return user == st.secrets.get("USER","") and pwd == st.secrets.get("PASSWORD","")
+    except Exception:
+        return False
+
+def login_view():
+    col = st.columns([1,1,1])[1]
+    with col:
+        st.image(asset("Nexa_logo.png"), width=180)
+        st.markdown("### Acceso")
+        u = st.text_input("Usuario", placeholder="Usuario")
+        p = st.text_input("Contraseña", type="password", placeholder="••••••••")
+        if st.button("Ingresar"):
+            if check_login(u, p):
+                st.session_state.authed = True
+                st.experimental_rerun()
+            else:
+                st.error("Usuario o contraseña inválidos.")
+
+# =========================
+#   LÓGICA RAG (SIN CAMBIOS)
+# =========================
+
+# (Constantes, mapeos y funciones del bot — idénticas a la versión funcional)
 SHEET_ID = "1SaXuzhY_sJ9Tk9MOLDLAI4OVdsNbCP-X4L8cP15yTqo"
 WORKSHEET = "MODELO_BOT"
 
@@ -78,7 +183,6 @@ SPANISH_MONTHS = {
     "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
 }
 
-# ---------- Utilidades ----------
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", unidecode(str(s)).strip().lower())
 
@@ -114,7 +218,6 @@ def _to_datetime(x) -> Optional[pd.Timestamp]:
     except Exception:
         return None
 
-# ---------- Credenciales ----------
 def _safe_secret_keys():
     try: return list(st.secrets._secrets.keys())
     except Exception:
@@ -149,7 +252,6 @@ def get_gspread_client():
     creds=Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
-# ---------- Datos ----------
 @st.cache_data(show_spinner=False)
 def get_data_from_gsheet() -> pd.DataFrame:
     gc=get_gspread_client()
@@ -166,13 +268,9 @@ def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
             if _norm(can)==key: mapping[c]=can
         if key in COL_ALIASES: mapping[c]=COL_ALIASES[key]
     df=raw.rename(columns=mapping).copy()
-
-    # Fechas → datetime (NaT seguro)
     for col in DATE_FIELDS:
         if col in df.columns:
             df[col]=pd.to_datetime(df[col], errors="coerce", dayfirst=True, infer_datetime_format=True)
-
-    # Numéricos
     for col in NUM_FIELDS:
         if col in df.columns:
             df[col]=(df[col].astype(str)
@@ -180,13 +278,11 @@ def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
                       .str.replace(".","",regex=False)
                       .str.replace(",",".",regex=False))
             df[col]=pd.to_numeric(df[col], errors="coerce")
-
     if "FACTURADO" in df.columns:
         df["FACTURADO"]=(df["FACTURADO"].astype(str).str.strip().str.upper()
                          .replace({"TRUE":"SI","FALSE":"NO","1":"SI","0":"NO"}))
     return df
 
-# ---------- Fragmentos (OT vacío → “Sin asignar”) ----------
 def _display_value_for_fragment(col: str, val) -> str:
     empty=(val is None) or (isinstance(val,float) and pd.isna(val)) or (str(val).strip()=="")
     if col=="OT" and empty: return "Sin asignar"
@@ -204,7 +300,6 @@ def make_fragments(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
         ids.append(str(idx))
     return frags, ids
 
-# ---------- OpenAI ----------
 def get_openai_client() -> OpenAI:
     api_key=os.getenv("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY",""))
     if not api_key:
@@ -218,14 +313,18 @@ def embed_texts(client: OpenAI, texts: List[str], model="text-embedding-3-small"
         out.extend([d.embedding for d in resp.data])
     return out
 
-# ---------- Índice vectorial (SIEMPRE sobre el subconjunto filtrado) ----------
+CHROMA_AVAILABLE = True
+try:
+    import chromadb
+except Exception:
+    CHROMA_AVAILABLE = False
+
 def _hash_frags(frags: List[str]) -> str:
-    h=hashlib.md5()
+    import hashlib as _h; h=_h.md5()
     for t in frags: h.update(t.encode("utf-8"))
     return h.hexdigest()
 
 def ensure_index(frags: List[str], ids: List[str]):
-    """No indexa si no hay frags (evita mezclar)."""
     if len(frags)==0:
         st.session_state.subset_backend=None
         st.session_state.subset_index_hash=None
@@ -271,7 +370,6 @@ def retrieve_top_subset(query: str, k=6) -> Tuple[List[str], List[str]]:
     idx=np.argsort(-(An@qn).ravel())[:k]
     return [st.session_state.subset_docs[i] for i in idx], [st.session_state.subset_ids[i] for i in idx]
 
-# ---------- Prompts ----------
 def system_prompt() -> str:
     return f"""
 Eres un CONSULTOR DE GESTIÓN y ANALISTA DE DATOS para Fénix Automotriz.
@@ -293,7 +391,6 @@ def llm_answer(question: str, docs: List[str]):
     resp=client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.2)
     return resp.choices[0].message.content, messages
 
-# ---------- Parser / reglas genéricas ----------
 def infer_schema_for_llm(df: pd.DataFrame) -> Dict[str,Any]:
     schema={}
     for c in df.columns:
@@ -361,16 +458,9 @@ def detect_future_intent(question: str) -> bool:
     keys=["proxim","próxim","pronto","futuro","en adelante","desde hoy","a partir de hoy","hoy en adelante","venider"]
     return any(k in q for k in keys)
 
-# ---------- NUEVO: MES — Analizador robusto y filtro PRIMARIO ----------
 def parse_explicit_month_year(question: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
-    """
-    Detecta un nombre de mes en español (con acentos normalizados) y un AÑO opcional.
-    Retorna (month_num, year, matched_month_name) o (None, None, None).
-    Coincidencias por palabra completa para evitar falsos positivos (p.ej. 'marca' ≠ 'marzo').
-    """
     q=_norm(question)
     for name, num in SPANISH_MONTHS.items():
-        # palabra completa
         if re.search(rf"\b{name}\b", q):
             m=re.search(r"(19|20)\d{2}", q)
             year=int(m.group(0)) if m else None
@@ -383,11 +473,6 @@ def month_to_range(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
     return start, end
 
 def apply_month_filter_first(df: pd.DataFrame, month: int, year: int, date_col: str) -> pd.DataFrame:
-    """
-    Filtro PRIMARIO: Se aplica ANTES de cualquier otro filtro.
-    Acepta solo filas cuyo date_col pertenece al mes/año indicados.
-    No hace fallback. NaT quedan fuera (estricto).
-    """
     if date_col not in df.columns: return pd.DataFrame()
     s = df[date_col]
     if not pd.api.types.is_datetime64_any_dtype(s):
@@ -396,7 +481,6 @@ def apply_month_filter_first(df: pd.DataFrame, month: int, year: int, date_col: 
     return df[mask].copy()
 
 def enforce_future_guardrail(filters: List[Dict[str,Any]], df: pd.DataFrame, question: str) -> Tuple[List[Dict[str,Any]], Optional[str]]:
-    """Si intención futura, impone >= HOY en columna de fecha pertinente."""
     if not detect_future_intent(question): return filters, None
     date_col=choose_date_column(question, df)
     if not date_col: return filters, None
@@ -424,7 +508,6 @@ def enforce_future_guardrail(filters: List[Dict[str,Any]], df: pd.DataFrame, que
         out.append({"column":date_col,"op":"gte","value":[today]})
     return out, date_col
 
-# ---------- Filtro robusto (genérico, secundario) ----------
 def _ensure_list(x):
     if isinstance(x,list): return x
     if x is None: return []
@@ -495,7 +578,6 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
         log.append({"column":col,"op":op,"value":vals,"remaining":int(mask.sum())})
     return df[mask].copy(), log
 
-# ---------- Totales ----------
 def requires_totals(question: str) -> bool:
     q=_norm(question)
     return any(k in q for k in ["total","suma","sumar","monto","factur","neto","bruto","iva","ingreso"])
@@ -520,7 +602,6 @@ def append_totals_row(display_df: pd.DataFrame) -> pd.DataFrame:
             total_row[col]=pd.to_numeric(display_df[col], errors="coerce").sum(skipna=True)
     return pd.concat([display_df, pd.DataFrame([total_row], columns=display_df.columns)], ignore_index=True)
 
-# ---------- Gráfico: facturación por mes ----------
 def show_monthly_facturacion_chart(df: pd.DataFrame, month: int, year: int):
     if df.empty or "TIPO CLIENTE" not in df.columns or "MONTO PRINCIPAL NETO" not in df.columns:
         return
@@ -532,137 +613,157 @@ def show_monthly_facturacion_chart(df: pd.DataFrame, month: int, year: int):
     st.markdown(f"**Facturación (neto) por TIPO CLIENTE — {year}-{month:02d}**")
     st.bar_chart(g.set_index("TIPO CLIENTE"))
 
-# ---------- UI ----------
-st.title("🔥 Fénix Automotriz — RAG con MES en español (estricto) + Fechas futuras (≥ hoy)")
-st.caption("Si la pregunta especifica mes, se filtra PRIMERO por ese mes y se indexa solo ese subconjunto. Sin mezclas.")
-
-with st.sidebar:
-    st.subheader("⚙️ Parámetros")
-    top_k=st.slider("Top-K fragmentos para contexto", 3, 15, 6, 1)
-    show_diag=st.checkbox("🔎 Modo diagnóstico", value=True)
-    force_index=st.button("🔁 Reindexar subconjunto")
-
+# ============
+#  CARGA DATA
+# ============
 raw_df=get_data_from_gsheet()
 if raw_df.empty:
     st.error("La hoja MODELO_BOT está vacía o no se pudo leer."); st.stop()
 df=normalize_df(raw_df)
 
-if "messages" not in st.session_state: st.session_state.messages=[]
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]): st.markdown(m["content"])
+# =========================
+#      SIDEBAR / NAV
+# =========================
+with st.sidebar:
+    st.image(asset("Nexa_logo.png"), use_column_width=True)
+    st.markdown("---")
+    nav = st.radio("Navegación", ["Consulta IA", "Análisis de negocio", "Configuración", "Diagnóstico y uso", "Soporte"], index=0)
+    st.markdown("---")
+    if st.session_state.authed:
+        if st.button("Cerrar sesión"):
+            st.session_state.authed = False
+            st.experimental_rerun()
 
-question=st.chat_input("Ej.: 'facturación de marzo 2025', 'entregas de septiembre', 'próximas facturas', 'este mes'…")
-if question:
-    # ============= 1) Analizador de MES — PRIMARIO =============
+# =========================
+#          LOGIN
+# =========================
+if not st.session_state.authed:
+    login_view()
+    st.markdown('<div class="nexa-footer">Desarrollado por Nexa Corp. todos los derechos reservados.</div>', unsafe_allow_html=True)
+    st.stop()
+
+# =========================
+#        TOP BAR (logos)
+# =========================
+c1, c2 = st.columns([5,1])
+with c1:
+    st.title("Consulta Nexa IA")
+    st.caption("Asistente de análisis para Fénix Automotriz (RAG + filtros exactos)")
+with c2:
+    st.markdown('<div class="nexa-topbar">', unsafe_allow_html=True)
+    st.image(asset("Fenix_isotipo.png"), width=72)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# =========================
+#         PÁGINAS
+# =========================
+
+# Avatares del chat
+USER_AVATAR = asset("Fenix_isotipo.png")
+BOT_AVATAR  = asset("Isotipo_Nexa.png")
+
+def estimate_tokens(*texts) -> int:
+    # estimación simple: ~4 caracteres por token
+    total_chars = sum(len(t) for t in texts if t)
+    return max(1, total_chars // 4)
+
+# --- Página: Consulta IA ---
+def page_chat():
+    with st.expander("⚙️ Parámetros de consulta", expanded=False):
+        top_k = st.slider("Top-K fragmentos para contexto", 3, 15, 6, 1, key="top_k_chat")
+        show_diag = st.checkbox("🔎 Mostrar diagnóstico", value=True, key="diag_chat")
+        force_index = st.button("🔁 Reindexar subconjunto")
+
+    # Mostrar historial
+    if "messages" not in st.session_state: st.session_state.messages=[]
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"], avatar=(USER_AVATAR if m["role"]=="user" else BOT_AVATAR)):
+            st.markdown(m["content"])
+
+    question=st.chat_input("Escribe tu consulta…")
+    if not question:
+        return
+
+    # ===== Pipeline (idéntico al anterior) =====
+    # 1) Analizador de MES — PRIMARIO
     month_num, year_num, month_token = parse_explicit_month_year(question)
     month_mode = month_num is not None
     used_month_col = None
     subset_df = pd.DataFrame()
 
     if month_mode:
-        # Seleccionar columna de fecha en función de la intención; por defecto facturación
         if "entreg" in _norm(question) and "FECHA ENTREGA" in df.columns:
             used_month_col="FECHA ENTREGA"
         elif "pago" in _norm(question) and "FECHA DE PAGO FACTURA" in df.columns:
             used_month_col="FECHA DE PAGO FACTURA"
         else:
             used_month_col="FECHA DE FACTURACION" if "FECHA DE FACTURACION" in df.columns else choose_date_column(question, df)
-
-        # Año por defecto: actual
         year_num = year_num if year_num else dt.date.today().year
-
-        # Filtro PRIMARIO por mes (sin fallback, NaT fuera)
         subset_df = apply_month_filter_first(df, month_num, year_num, used_month_col)
 
-    # ============= 2) Analizador de intenciones (secundario) =============
-    #    Se aplica sobre subset_df si month_mode, sino sobre df
+    # 2) Intent parser (secundario)
     base_for_filters = subset_df if month_mode else df
     llm_filters = llm_parse_intent(question, base_for_filters)
     extracted = llm_filters.get("filters", [])
 
-    # Reglas de FUTURO (solo si NO hay mes explícito)
     used_date_col = None
     if not month_mode and detect_future_intent(question):
         extracted, used_date_col = enforce_future_guardrail(extracted, base_for_filters, question)
 
-    # ============= 3) Aplicar filtros exactos (secundarios) =============
+    # 3) Filtros exactos
     filtered_df, filter_log = apply_filters(base_for_filters, extracted)
 
-    # Post-filter defensivo por mes (si month_mode): garantiza que nada escape del mes
     if month_mode and not subset_df.empty and used_month_col in filtered_df.columns:
         s = filtered_df[used_month_col]
         if not pd.api.types.is_datetime64_any_dtype(s):
             s = pd.to_datetime(s, errors="coerce", dayfirst=True)
         filtered_df = filtered_df[(s.dt.year == year_num) & (s.dt.month == month_num)]
 
-    # Post-filter defensivo de futuro (si aplica)
     if not month_mode and detect_future_intent(question) and used_date_col and used_date_col in filtered_df.columns:
         today_ts = pd.to_datetime(dt.date.today())
         s = filtered_df[used_date_col]
         filtered_df = filtered_df[s.isna() | (s >= today_ts)]
 
-    # ============= 4) Subconjunto final para indexar =============
-    # - Si month_mode: NO fallback al DF completo (evita mezclar otros meses).
-    # - Si intención futura: NO fallback al DF completo.
-    # - En otros casos, si queda vacío, fallback al DF completo.
     if month_mode:
-        final_subset = filtered_df  # estricto al mes
+        final_subset = filtered_df
     else:
         if detect_future_intent(question):
-            final_subset = filtered_df  # sin fallback en futuro
+            final_subset = filtered_df
         else:
             final_subset = filtered_df if not filtered_df.empty else df
 
-    # ============= 5) Indexar SOLO el subconjunto final =============
     frags, ids = make_fragments(final_subset)
     if force_index:
         for k in ["subset_index_hash","subset_collection","subset_embs","subset_ids","subset_docs","subset_backend"]:
             st.session_state.pop(k, None)
     ensure_index(frags, ids)
 
-    # ============= 6) Recuperación SOLO del subconjunto y respuesta LLM =============
     docs, row_ids = retrieve_top_subset(question, k=top_k)
     answer, prompt_msgs = llm_answer(question, docs)
 
-    # ============= 7) Totales y salida UI =============
-    want_totals = requires_totals(question)
-    totals_dict = totals_for_df(final_subset) if want_totals and not final_subset.empty else {}
+    # ===== Métricas de uso (estimación) =====
+    st.session_state.stats["queries"] += 1
+    st.session_state.stats["tokens_est"] += estimate_tokens(question, *docs, answer)
 
+    # ===== UI Chat =====
     st.session_state.messages += [{"role":"user","content":question},
                                   {"role":"assistant","content":answer}]
 
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=BOT_AVATAR):
         if show_diag:
-            with st.expander("🧭 Diagnóstico (MES / FECHAS)"):
-                st.markdown("**Mes detectado:**"); st.json({"month_num": month_num, "year": year_num, "token": month_token, "date_col": used_month_col})
-                st.markdown("**Filtros del LLM (secundarios):**"); st.json(extracted)
+            with st.expander("🧭 Diagnóstico", expanded=False):
+                st.write("**Mes detectado**:", {"month": month_num, "year": year_num, "date_col": used_month_col})
+                st.write("**Filtros del LLM**:", extracted)
                 if not month_mode:
-                    st.markdown("**Guardarraíl futuro (>= hoy):**"); st.json({"used_date_col": used_date_col})
-                st.markdown("**Aplicación secuencial y remanentes:**"); st.json(filter_log)
-                st.markdown(f"**Tamaño del subconjunto indexado:** {len(final_subset)} filas")
-            with st.expander("🧩 Top-3 fragmentos del subconjunto"):
-                for i, d in enumerate(docs[:3], 1):
-                    st.markdown(f"**Fragmento {i}**\n\n```\n{d}\n```")
-            with st.expander("🧪 Prompt exacto enviado al LLM"):
-                st.write("**System Prompt:**"); st.code(prompt_msgs[0]["content"])
-                st.write("**User Prompt:**"); st.code(prompt_msgs[1]["content"])
-
-        if month_mode and final_subset.empty:
-            st.info("No se encontraron filas para el mes solicitado.")
-        elif (not month_mode) and detect_future_intent(question) and final_subset.empty:
-            st.info("No se encontraron filas con fechas futuras (≥ hoy) según tu consulta.")
-
+                    st.write("**Guardarraíl futuro (>= hoy)**:", {"used_date_col": used_date_col})
+                st.write("**Aplicación secuencial**:", filter_log)
+                st.write("**Filas indexadas**:", len(final_subset))
         st.markdown(answer)
 
-        # Tabla + totales
         if not final_subset.empty:
             show_cols=[c for c in CANONICAL_FIELDS if c in final_subset.columns]
             to_show = final_subset[show_cols] if show_cols else final_subset.copy()
-            if want_totals:
-                if totals_dict:
-                    cols = st.columns(max(1,len(totals_dict)))
-                    for i,(k,v) in enumerate(totals_dict.items()):
-                        with cols[i]: st.metric(label=f"Suma {k}", value=f"{v:,.0f}".replace(",", "."))
+            if requires_totals(question):
                 to_show = append_totals_row(to_show)
             st.markdown("**Subconjunto filtrado (auditoría):**")
             st.dataframe(to_show, use_container_width=True, hide_index=True)
@@ -670,12 +771,83 @@ if question:
                                data=to_show.to_csv(index=False).encode("utf-8"),
                                file_name="subconjunto_filtrado.csv", mime="text/csv")
 
-            # Gráfico: facturación por mes
-            if month_mode and ("factur" in _norm(question)) and ("FECHA DE FACTURACION" in final_subset.columns):
-                year_for_chart = year_num if year_num else dt.date.today().year
-                # Asegurar que el gráfico use SÓLO el mes/año indicados
-                s = final_subset["FECHA DE FACTURACION"]
-                if not pd.api.types.is_datetime64_any_dtype(s):
-                    s = pd.to_datetime(s, errors="coerce", dayfirst=True)
-                subset_for_chart = final_subset[(s.dt.year == year_for_chart) & (s.dt.month == month_num)].copy()
-                show_monthly_facturacion_chart(subset_for_chart, month_num, year_for_chart)
+# --- Página: Análisis de negocio ---
+def page_analytics():
+    st.subheader("Análisis de negocio")
+    left, right = st.columns([2,1])
+    with right:
+        year = st.number_input("Año", value=dt.date.today().year, step=1, format="%d")
+        month = st.selectbox("Mes", list(SPANISH_MONTHS.keys()), index=list(SPANISH_MONTHS.keys()).index("enero"))
+        month_num = SPANISH_MONTHS[month]
+        date_col = st.selectbox("Columna de fecha", ["FECHA DE FACTURACION","FECHA ENTREGA","FECHA DE PAGO FACTURA","FECHA INGRESO PLANTA"])
+        metric = st.selectbox("Métrica a sumar", ["MONTO PRINCIPAL NETO","MONTO PRINCIPAL BRUTO [F]","IVA PRINCIPAL [F]"])
+    with left:
+        if date_col in df.columns:
+            subset = apply_month_filter_first(df, month_num, int(year), date_col)
+            st.dataframe(subset, use_container_width=True, hide_index=True)
+            if "FECHA DE FACTURACION" in subset.columns and metric in subset.columns:
+                # Gráfico por TIPO CLIENTE (manteniendo la función existente para facturación neta)
+                st.markdown("---")
+                st.markdown("#### Facturación por TIPO CLIENTE")
+                agg=(subset.groupby("TIPO CLIENTE", dropna=False)[metric]
+                        .sum(min_count=1).fillna(0.0).sort_values(ascending=False))
+                st.bar_chart(agg)
+        else:
+            st.info("La columna seleccionada no existe en la hoja.")
+
+# --- Página: Configuración ---
+def page_settings():
+    st.subheader("Configuración de apariencia")
+    theme = st.selectbox("Tema de color", list(PALETTE.keys()), index=list(PALETTE.keys()).index(st.session_state.theme_name))
+    if theme != st.session_state.theme_name:
+        st.session_state.theme_name = theme
+        apply_theme(theme)
+        st.success("Tema aplicado.")
+    st.markdown("Vista previa de botones y entradas:")
+    c1, c2, c3 = st.columns(3)
+    with c1: st.button("Botón primario")
+    with c2: st.text_input("Campo de texto")
+    with c3: st.download_button("Descargar", "ok", file_name="demo.txt")
+    st.markdown("---")
+    st.caption("Estos cambios afectan la capa visual sin modificar la lógica del bot.")
+
+# --- Página: Diagnóstico y uso ---
+def page_diagnostics():
+    st.subheader("Diagnóstico y uso")
+    q = st.session_state.stats["queries"]
+    t = st.session_state.stats["tokens_est"]
+    c1, c2 = st.columns(2)
+    c1.metric("Consultas en esta sesión", q)
+    c2.metric("Tokens estimados", f"{t:,}".replace(",","."))
+    st.markdown("#### Esquema detectado")
+    schema = {c:("date" if pd.api.types.is_datetime64_any_dtype(df[c]) else "number" if pd.api.types.is_numeric_dtype(df[c]) else "text") for c in df.columns}
+    st.json(schema)
+    st.markdown("#### Dimensión de datos")
+    st.write(f"Filas: {len(df):,} — Columnas: {len(df.columns)}".replace(",", "."))
+
+# --- Página: Soporte ---
+def page_support():
+    st.subheader("Soporte")
+    st.markdown("Para ayuda y soporte técnico:")
+    st.markdown("- **Correo:** soporte@nexa.cl")
+    st.markdown("- **Web:** www.nexa.cl")
+    st.image(asset("Nexa_logo.png"), width=180)
+
+# =========================
+#      ROUTER DE PÁGINA
+# =========================
+if nav == "Consulta IA":
+    page_chat()
+elif nav == "Análisis de negocio":
+    page_analytics()
+elif nav == "Configuración":
+    page_settings()
+elif nav == "Diagnóstico y uso":
+    page_diagnostics()
+elif nav == "Soporte":
+    page_support()
+
+# =========================
+#          FOOTER
+# =========================
+st.markdown('<div class="nexa-footer">Desarrollado por Nexa Corp. todos los derechos reservados.</div>', unsafe_allow_html=True)
