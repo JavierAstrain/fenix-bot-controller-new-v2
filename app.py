@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Fénix Automotriz — Agente de Negocio (RAG) en Streamlit
-Fix4: Hibridación semántica + filtros deterministas (Pandas) para respuestas NUMÉRICAS correctas.
-- Interpreta consultas comunes ("sin facturar", "entregados", meses, rangos de fechas, etc.)
-- Aplica filtros sobre el DataFrame y calcula métricas (conteos/sumas/promedios)
-- Luego usa RAG (Chroma o fallback) solo para contexto textual y explicación con LLM
+Fix6: Prompts refinados + planner con guía de dominio + ejecución determinista.
+- System prompt con rol explícito (consultor/analista de Fénix) + misión/visión/procesos.
+- Prompt de consulta con instrucciones estrictas de uso de datos (No inventar / solo planilla).
+- Planner (function-calling) instruido con reglas de negocio para seleccionar columnas de fecha
+  (p.ej., facturación -> FECHA DE FACTURACION) y filtros comunes.
+- Mantiene: credenciales robustas, fallback sin Chroma, visualizaciones, descarga CSV.
 """
-import os, re, json, hashlib
-from typing import List, Dict, Tuple
+import os, re, json, hashlib, math
+from typing import List, Dict, Tuple, Any, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -23,7 +25,7 @@ try:
 except Exception:
     CHROMA_AVAILABLE = False
 
-st.set_page_config(page_title="Fénix | Agente de Negocio (RAG)", page_icon="🔥", layout="wide")
+st.set_page_config(page_title="Fénix | Agente de Negocio (RAG + Planner)", page_icon="🔥", layout="wide")
 
 SHEET_ID = "1SaXuzhY_sJ9Tk9MOLDLAI4OVdsNbCP-X4L8cP15yTqo"
 WORKSHEET = "MODELO_BOT"
@@ -48,31 +50,24 @@ CANONICAL_FIELDS = [
     "CANTIDAD DE VEHICULO","DIAS DE PAGO DE FACTURA",
 ]
 
-NORMALIZATION_MAP = {
-    "ot":"OT","patente":"PATENTE","marca":"MARCA","modelo":"MODELO",
-    "estado servicio":"ESTADO SERVICIO","estado del servicio":"ESTADO SERVICIO",
-    "estado presupuesto":"ESTADO PRESUPUESTO",
-    "fecha ingreso planta":"FECHA INGRESO PLANTA","fecha de ingreso planta":"FECHA INGRESO PLANTA",
-    "fecha salida planta":"FECHA SALIDA PLANTA","proceso":"PROCESO",
-    "piezas desabolladas":"PIEZAS DESABOLLADAS","piezas pintadas":"PIEZAS PINTADAS",
-    "asignacion desarme":"ASIGNACIÓN DESARME","asignación desarme":"ASIGNACIÓN DESARME",
-    "asignacion desabolladura":"ASIGNACIÓN DESABOLLADURA","asignación desabolladura":"ASIGNACIÓN DESABOLLADURA",
-    "asignacion pintura":"ASIGNACIÓN PINTURA","asignación pintura":"ASIGNACIÓN PINTURA",
-    "fecha inspeccion":"FECHA INSPECCIÓN","fecha inspección":"FECHA INSPECCIÓN",
-    "tipo cliente":"TIPO CLIENTE","nombre cliente":"NOMBRE CLIENTE","siniestro":"SINIESTRO",
-    "tipo vehiculo":"TIPO VEHÍCULO","tipo vehículo":"TIPO VEHÍCULO",
-    "fecha recepcion":"FECHA RECEPCION","fecha recepción":"FECHA RECEPCION",
-    "fecha entrega":"FECHA ENTREGA","monto principal neto":"MONTO PRINCIPAL NETO",
-    "iva principal":"IVA PRINCIPAL [F]","iva principal f":"IVA PRINCIPAL [F]",
-    "monto principal bruto":"MONTO PRINCIPAL BRUTO [F]","monto principal bruto f":"MONTO PRINCIPAL BRUTO [F]",
-    "numero de factura":"NUMERO DE FACTURA","n° de factura":"NUMERO DE FACTURA","n de factura":"NUMERO DE FACTURA",
-    "fecha de facturacion":"FECHA DE FACTURACION","fecha de facturación":"FECHA DE FACTURACION",
-    "fecha pago factura":"FECHA DE PAGO FACTURA","fecha de pago factura":"FECHA DE PAGO FACTURA",
-    "facturado":"FACTURADO","numero de dias en planta":"NUMERO DE DIAS EN PLANTA",
-    "numero de días en planta":"NUMERO DE DIAS EN PLANTA","dias en dominio":"DIAS EN DOMINIO",
-    "días en dominio":"DIAS EN DOMINIO","cantidad de vehiculo":"CANTIDAD DE VEHICULO",
-    "cantidad de vehículo":"CANTIDAD DE VEHICULO","dias de pago de factura":"DIAS DE PAGO DE FACTURA",
-    "días de pago de factura":"DIAS DE PAGO DE FACTURA",
+COL_ALIASES = {
+    "dias en planta": "NUMERO DE DIAS EN PLANTA",
+    "días en planta": "NUMERO DE DIAS EN PLANTA",
+    "dias de pago": "DIAS DE PAGO DE FACTURA",
+    "fecha facturacion": "FECHA DE FACTURACION",
+    "fecha facturación": "FECHA DE FACTURACION",
+    "monto bruto": "MONTO PRINCIPAL BRUTO [F]",
+    "monto neto": "MONTO PRINCIPAL NETO",
+    "iva": "IVA PRINCIPAL [F]",
+    "fecha recepcion": "FECHA RECEPCION",
+    "fecha recepción": "FECHA RECEPCION",
+    "fecha ingreso": "FECHA INGRESO PLANTA",
+    "fecha salida": "FECHA SALIDA PLANTA",
+    "entrega": "FECHA ENTREGA",
+    "facturado?": "FACTURADO",
+    "numero factura": "NUMERO DE FACTURA",
+    "nro factura": "NUMERO DE FACTURA",
+    "n° factura": "NUMERO DE FACTURA",
 }
 
 DATE_FIELDS_CANDIDATES = [
@@ -85,7 +80,7 @@ NUMERIC_FIELDS_CANDIDATES = [
     "NUMERO DE DIAS EN PLANTA","DIAS EN DOMINIO","CANTIDAD DE VEHICULO","DIAS DE PAGO DE FACTURA",
 ]
 
-# ---------------- Credenciales Google ----------------
+# ----------------- Credenciales Google -----------------
 def _try_load_sa_from_secrets() -> Dict:
     for key in ["gcp_service_account", "service_account", "google_service_account"]:
         try:
@@ -136,6 +131,7 @@ def get_gspread_client():
     creds = Credentials.from_service_account_info(service_info, scopes=scopes)
     return gspread.authorize(creds)
 
+# ----------------- Utilidades DF -----------------
 def norm_text(s: str) -> str:
     s = unidecode(str(s)).lower().strip()
     s = re.sub(r"[\[\]\(\)]+", "", s)
@@ -146,8 +142,11 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = {}
     for c in df.columns:
         key = norm_text(c)
-        mapped = NORMALIZATION_MAP.get(key)
-        if mapped: new_cols[c] = mapped
+        for can in CANONICAL_FIELDS:
+            if norm_text(can) == key:
+                new_cols[c] = can
+        if key in COL_ALIASES:
+            new_cols[c] = COL_ALIASES[key]
     return df.rename(columns=new_cols)
 
 def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,7 +157,6 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].astype(str).str.replace(r"[.$ ]", "", regex=True).str.replace(",", ".", regex=True)
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    # normalizar FACTURADO (string)
     if "FACTURADO" in df.columns:
         df["FACTURADO"] = df["FACTURADO"].astype(str).str.strip().str.upper().replace({
             "TRUE":"SI","FALSE":"NO","1":"SI","0":"NO"
@@ -168,7 +166,7 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
 def build_fragments(df: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in CANONICAL_FIELDS if c in df.columns]
     def row_to_fragment(row: pd.Series) -> str:
-        return " | ".join([f"{c}: {row.get(c, '')}" for c in cols])
+        return " | ".join([f\"{c}: {row.get(c, '')}\" for c in cols])
     df = df.copy()
     df["__fragment__"] = df.apply(row_to_fragment, axis=1)
     df["__row_id__"] = df.index.astype(str)
@@ -190,12 +188,35 @@ def hash_dataframe(df: pd.DataFrame) -> str:
                    .to_csv(index=False).encode("utf-8")
     return hashlib.md5(data_bytes).hexdigest()
 
+# ----------------- OpenAI -----------------
 def get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY", ""))
     if not api_key:
         st.error("OPENAI_API_KEY no está configurada.")
         st.stop()
     return OpenAI(api_key=api_key)
+
+# System Prompt reforzado (rol + reglas)
+def system_prompt() -> str:
+    return f"""
+    Eres un CONSULTOR DE GESTIÓN y ANALISTA DE DATOS para Fénix Automotriz.
+    Tu única fuente de verdad son los datos provistos desde la hoja MODELO_BOT.
+    Contexto de negocio:
+    {BUSINESS_CONTEXT}
+
+    Reglas de oro:
+    - Usa EXCLUSIVAMENTE los datos proporcionados; NO inventes ni alucines.
+    - Si la información no está en los datos, di claramente: "No tengo la información necesaria en los datos".
+    - Puedes realizar cálculos simples (sumas, promedios, min/max) sobre los registros filtrados que se te entregan.
+    - Analiza fechas, montos y estados; al responder, sé conciso y directo.
+    - Cuando el usuario pida tablas, listados o detalle, preséntalo de forma ordenada.
+    - Si el usuario no especifica columna de fecha, prefiere:
+        * facturación/ingresos → FECHA DE FACTURACION
+        * ingresos a planta → FECHA INGRESO PLANTA
+        * entregas → FECHA ENTREGA
+        * recepción → FECHA RECEPCION
+    - No contradigas los totales ya calculados por la aplicación si se te proveen.
+    """.strip()
 
 def embed_texts(client: OpenAI, texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
     out = []
@@ -206,7 +227,7 @@ def embed_texts(client: OpenAI, texts: List[str], model: str = "text-embedding-3
         out.extend([d.embedding for d in resp.data])
     return out
 
-# ------------- Backend vectorial -------------
+# ----------------- Vector index -----------------
 def ensure_index(df: pd.DataFrame):
     current_hash = hash_dataframe(df)
     if "index_hash" not in st.session_state or st.session_state.index_hash != current_hash:
@@ -265,155 +286,211 @@ def retrieve_top_k(query: str, k: int = 12):
         metas = [{"row_id": st.session_state.simple_ids[i]} for i in idx]
         return docs, metas
 
-# ------------- Intérprete de consultas (filtros deterministas) -------------
-SP_MONTHS = {
-    "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
-    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
-}
+# ----------------- Planner (function-calling) -----------------
+def infer_schema(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    schema = {}
+    for c in df.columns:
+        if c.startswith("__"): continue
+        s = df[c]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            dtype = "date"; ex = [str(x.date()) for x in s.dropna().unique()[:5]]
+        elif pd.api.types.is_numeric_dtype(s):
+            dtype = "numeric"; ex = [float(x) for x in s.dropna().unique()[:5]]
+        else:
+            dtype = "text"; ex = [str(x) for x in s.dropna().astype(str).unique()[:5]]
+        schema[c] = {"dtype": dtype, "examples": ex}
+    return schema
 
-def parse_date_mentions(q: str) -> Tuple[pd.Timestamp, pd.Timestamp, str]:
-    """Devuelve (start, end, label) si detecta un mes/rango; si no, (None,None,"")."""
-    ql = unidecode(q).lower()
-    # Rango explícito dd/mm/yyyy - dd/mm/yyyy
-    m = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}).{0,10}(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", ql)
-    if m:
-        s = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce")
-        e = pd.to_datetime(m.group(2), dayfirst=True, errors="coerce")
-        if pd.notna(s) and pd.notna(e):
-            return s, e, f"entre {s.date()} y {e.date()}"
-    # Mes + año
-    for name, num in SP_MONTHS.items():
-        if name in ql:
-            # ¿año?
-            m2 = re.search(rf"{name}\s+(\d{{4}})", ql)
-            if m2:
-                y = int(m2.group(1))
-            else:
-                y = pd.Timestamp.today().year
-            start = pd.Timestamp(year=y, month=num, day=1)
-            end = (start + pd.offsets.MonthEnd(0))
-            return start, end, f"{name.capitalize()} {y}"
-    # Este mes / mes pasado
-    if "este mes" in ql or "actual" in ql:
-        today = pd.Timestamp.today()
-        start = pd.Timestamp(year=today.year, month=today.month, day=1)
-        end = (start + pd.offsets.MonthEnd(0))
-        return start, end, "este mes"
-    if "mes pasado" in ql or "ultimo mes" in ql or "último mes" in ql:
-        today = pd.Timestamp.today() - pd.offsets.MonthBegin(1)
-        start = pd.Timestamp(year=today.year, month=today.month, day=1)
-        end = (start + pd.offsets.MonthEnd(0))
-        return start, end, "mes pasado"
-    return None, None, ""
+def llm_make_plan(question: str, schema: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    client = get_openai_client()
+    rules = (
+        "Reglas para elegir columna de fecha:\n"
+        "- Si la pregunta es sobre facturas/facturación/ingresos: usar 'FECHA DE FACTURACION'.\n"
+        "- Si es sobre vehículos en planta o ingreso: 'FECHA INGRESO PLANTA'.\n"
+        "- Si es sobre entregas: 'FECHA ENTREGA'.\n"
+        "- Si es sobre recepción: 'FECHA RECEPCION'.\n"
+        "Reglas de filtros:\n"
+        "- 'sin facturar' => (FACTURADO in ['NO','PENDIENTE'] OR NUMERO DE FACTURA vacío).\n"
+        "- 'entregados' => 'FECHA ENTREGA' not empty.\n"
+        "- reconocer operadores >, >=, <, <= para 'NUMERO DE DIAS EN PLANTA' y montos.\n"
+        "- no inventes columnas; usa solo nombres del esquema.\n"
+    )
+    schema_json = json.dumps(schema)[:6000]
+    system = (
+        "Eres un planificador de consultas para datos tabulares de Fénix Automotriz. "
+        "Debes devolver un PLAN JSON (filters/aggregations/group_by) que otro componente ejecutará en Pandas. "
+        "No incluyas explicación; solo el JSON a través de la función."
+    )
+    user = f"Esquema:\n{schema_json}\n\n{rules}\n\nPregunta del usuario:\n{question}"
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "emitir_plan",
+            "description": "Devuelve el plan de consulta.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "column": {"type":"string"},
+                                "op": {"type": "string", "enum": ["eq","neq","gt","gte","lt","lte","contains","not_contains","in","not_in","empty","not_empty","between_dates"]},
+                                "value": {"type":"array","items":{"type":"string"}}
+                            },
+                            "required": ["column","op"]
+                        }
+                    },
+                    "date_column_preference": {"type": ["string","null"]},
+                    "aggregations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": {"type": "string", "enum": ["count","sum","avg","min","max"]},
+                                "column": {"type":"string"},
+                                "alias": {"type":"string"}
+                            },
+                            "required": ["op"]
+                        }
+                    },
+                    "group_by": {"type": ["string","null"]}
+                },
+                "required": ["filters","aggregations"]
+            }
+        }
+    }]
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.1,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        tools=tools,
+        tool_choice={"type":"function","function":{"name":"emitir_plan"}}
+    )
+    msg = resp.choices[0].message
+    plan = {"filters": [], "aggregations": [{"op":"count","alias":"cantidad"}], "date_column_preference": None, "group_by": None}
+    try:
+        if msg.tool_calls:
+            args = msg.tool_calls[0].function.arguments
+            cand = json.loads(args)
+            if isinstance(cand, dict):
+                plan.update(cand)
+    except Exception:
+        pass
+    return plan
 
-def build_mask(df: pd.DataFrame, q: str) -> Tuple[pd.Series, Dict]:
-    """Devuelve (mask, info) con filtros aplicados y metadatos para debug."""
-    qn = unidecode(q).lower()
+def map_column_name(col: str, available: List[str]) -> Optional[str]:
+    if col in available: return col
+    key = norm_text(col)
+    for a in available:
+        if norm_text(a) == key: return a
+    if key in COL_ALIASES:
+        cand = COL_ALIASES[key]
+        if cand in available: return cand
+    for a in available:
+        if key in norm_text(a): return a
+    return None
+
+def execute_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     mask = pd.Series(True, index=df.index)
-    info = {}
+    info = {"plan": plan, "applied_filters": []}
+    cols = [c for c in df.columns if not c.startswith("__")]
 
-    # Sin facturar
-    if any(k in qn for k in ["sin factur", "no factur", "no facturados", "pendiente de factur"]):
-        info["sin_factura"] = True
-        m1 = df["NUMERO DE FACTURA"].astype(str).str.strip().isin(["", "nan", "None", "0"]) if "NUMERO DE FACTURA" in df.columns else True
-        m2 = df["FACTURADO"].astype(str).str.upper().isin(["NO", "PENDIENTE", "NAN"]) if "FACTURADO" in df.columns else True
-        mask &= (m1 | m2)
+    # aplicar filtros
+    for f in plan.get("filters", []):
+        col = map_column_name(str(f.get("column","")), cols)
+        op = f.get("op","")
+        vals = f.get("value", [])
+        if not col or col not in df.columns:
+            continue
+        s = df[col]
+        m = pd.Series(True, index=df.index)
+        if op in ["eq","neq","contains","not_contains","in","not_in"]:
+            sv = s.astype(str).str.upper().str.strip()
+            vlist = [str(x).upper().strip() for x in vals] if isinstance(vals, list) else [str(vals).upper().strip()]
+            if op == "eq": m = sv.isin(vlist)
+            elif op == "neq": m = ~sv.isin(vlist)
+            elif op == "contains":
+                pat = "|".join([re.escape(v) for v in vlist]) if vlist else ""
+                m = sv.str.contains(pat, na=False)
+            elif op == "not_contains":
+                pat = "|".join([re.escape(v) for v in vlist]) if vlist else ""
+                m = ~sv.str.contains(pat, na=False)
+            elif op == "in": m = sv.isin(vlist)
+            elif op == "not_in": m = ~sv.isin(vlist)
+        elif op in ["gt","gte","lt","lte"]:
+            sn = pd.to_numeric(s, errors="coerce")
+            v = float(vals[0]) if isinstance(vals, list) and vals else math.nan
+            if op == "gt": m = sn > v
+            if op == "gte": m = sn >= v
+            if op == "lt": m = sn < v
+            if op == "lte": m = sn <= v
+        elif op in ["empty","not_empty"]:
+            if op == "empty":
+                m = s.isna() | (s.astype(str).str.strip() == "") | (s.astype(str).str.upper().isin(["NAN","NONE","NULL"]))
+            else:
+                m = ~(s.isna() | (s.astype(str).str.strip() == "") | (s.astype(str).str.upper().isin(["NAN","NONE","NULL"])))
+        elif op == "between_dates":
+            sd = pd.to_datetime(vals[0], dayfirst=True, errors="coerce")
+            ed = pd.to_datetime(vals[1], dayfirst=True, errors="coerce")
+            if pd.notna(sd) and pd.notna(ed):
+                if pd.api.types.is_datetime64_any_dtype(s):
+                    m = s.between(sd, ed)
+                else:
+                    s2 = pd.to_datetime(s, dayfirst=True, errors="coerce")
+                    m = s2.between(sd, ed)
+        mask &= m
+        info["applied_filters"].append({"column": col, "op": op, "value": vals, "remaining": int(mask.sum())})
 
-    # Entregados
-    if any(k in qn for k in ["entregado", "entregados"]):
-        if "FECHA ENTREGA" in df.columns:
-            info["entregados"] = True
-            mask &= df["FECHA ENTREGA"].notna()
+    filtered = df[mask].copy()
 
-    # En planta
-    if "en planta" in qn or "dias en planta" in qn or "días en planta" in qn:
-        if "NUMERO DE DIAS EN PLANTA" in df.columns:
-            info["en_planta"] = True
-            # si pide umbrales: >, <, >=, <= N
-            m = re.search(r"(?:>=|<=|>|<)\s*(\d+)", qn)
-            if m:
-                val = int(m.group(1))
-                if ">=" in qn: mask &= (df["NUMERO DE DIAS EN PLANTA"] >= val)
-                elif "<=" in qn: mask &= (df["NUMERO DE DIAS EN PLANTA"] <= val)
-                elif ">" in qn: mask &= (df["NUMERO DE DIAS EN PLANTA"] > val)
-                elif "<" in qn: mask &= (df["NUMERO DE DIAS EN PLANTA"] < val)
+    # agregaciones
+    aggs = plan.get("aggregations") or [{"op":"count","alias":"cantidad"}]
+    out = {"cantidad": len(filtered)}
+    for a in aggs:
+        op = a.get("op")
+        col = map_column_name(str(a.get("column","")), cols) if a.get("column") else None
+        alias = a.get("alias") or (f"{op}_{col}" if col else op)
+        if op == "count":
+            out[alias] = int(len(filtered))
+        elif op in ["sum","avg","min","max"] and col and col in filtered.columns:
+            sn = pd.to_numeric(filtered[col], errors="coerce")
+            if op == "sum": out[alias] = float(sn.sum())
+            if op == "avg": out[alias] = float(sn.mean())
+            if op == "min": out[alias] = float(sn.min())
+            if op == "max": out[alias] = float(sn.max())
+    info["metrics"] = out
+    return filtered, info
 
-    # Por mes/rango usando fechas de facturación si habla de facturas; sino recepción
-    ds, de, label = parse_date_mentions(q)
-    if ds is not None and de is not None:
-        info["periodo"] = label
-        date_col = "FECHA DE FACTURACION" if "factur" in qn else ("FECHA RECEPCION" if "recepcion" in qn or "recepción" in qn else None)
-        if date_col is None:
-            # fallback: preferimos FECHA DE FACTURACION y si no existe, FECHA INGRESO PLANTA
-            date_col = "FECHA DE FACTURACION" if "FECHA DE FACTURACION" in df.columns else "FECHA INGRESO PLANTA"
-        if date_col in df.columns:
-            mask &= df[date_col].between(ds, de)
-
-    # Por patente específica
-    mpat = re.search(r"\b([A-Z]{2,3}-?\d{2,3})\b", q.upper())
-    if mpat and "PATENTE" in df.columns:
-        info["patente"] = mpat.group(1)
-        mask &= df["PATENTE"].astype(str).str.upper().str.replace("-", "") == info["patente"].replace("-", "")
-
-    return mask, info
-
-def compute_metrics(df: pd.DataFrame) -> Dict:
-    out = {"cantidad": len(df)}
-    if "MONTO PRINCIPAL BRUTO [F]" in df.columns:
-        out["monto_bruto"] = float(df["MONTO PRINCIPAL BRUTO [F]"].fillna(0).sum())
-    if "MONTO PRINCIPAL NETO" in df.columns:
-        out["monto_neto"] = float(df["MONTO PRINCIPAL NETO"].fillna(0).sum())
-    if "IVA PRINCIPAL [F]" in df.columns:
-        out["iva"] = float(df["IVA PRINCIPAL [F]"].fillna(0).sum())
-    if "NUMERO DE DIAS EN PLANTA" in df.columns:
-        col = df["NUMERO DE DIAS EN PLANTA"].dropna()
-        if not col.empty:
-            out["dias_planta_prom"] = float(col.mean())
-            out["dias_planta_p95"] = float(col.quantile(0.95))
-    return out
-
-def metrics_to_text(m: Dict) -> str:
-    if not m: return ""
-    parts = [f"- Registros: {m.get('cantidad', 0):,.0f}"]
-    if "monto_bruto" in m: parts.append(f"- Monto bruto: ${m['monto_bruto']:,.0f}".replace(",", "."))
-    if "monto_neto" in m: parts.append(f"- Monto neto: ${m['monto_neto']:,.0f}".replace(",", "."))
-    if "iva" in m: parts.append(f"- IVA: ${m['iva']:,.0f}".replace(",", "."))
-    if "dias_planta_prom" in m: parts.append(f"- Días en planta (prom): {m['dias_planta_prom']:.1f}")
-    if "dias_planta_p95" in m: parts.append(f"- Días en planta (p95): {m['dias_planta_p95']:.1f}")
-    return "\n".join(parts)
-
-# ------------- Prompting -------------
-def build_prompt(context_chunks: List[str], question: str, metrics_text: str, filters_info: Dict) -> str:
+# ----------------- Respuesta -----------------
+def build_answer_prompt(context_chunks: List[str], question: str, metrics: Dict[str, Any]) -> str:
     ctx = "\n\n".join([f"- {c}" for c in context_chunks if c])
-    filtros = ", ".join([f"{k}: {v}" for k, v in filters_info.items()]) if filters_info else "—"
+    metrics_lines = [f"{k}: {v}" for k,v in metrics.items()]
     return f"""
-    Eres un analista de negocio de Fénix Automotriz. Responde SIEMPRE en español y
-    **usa los siguientes MÉTRICOS ya calculados** como verdad de referencia. No los contradigas.
+    Actúa como consultor/analista de Fénix Automotriz.
+    Usa **únicamente** los datos proporcionados; si falta info, responde: "No tengo la información necesaria en los datos".
+    Puedes realizar cálculos simples sobre los registros filtrados que se te entregan.
+    Sé conciso y al punto. Si el usuario pide tablas o detalle, indícalo en tu respuesta; la app ya las mostrará aparte.
 
-    Filtros aplicados (deterministas sobre DataFrame): {filtros}
-    Métricos calculados:
-    {metrics_text or '—'}
+    Totales calculados por la app (no los contradigas):
+    {chr(10).join(metrics_lines) if metrics_lines else '—'}
 
-    Usa el siguiente contexto (muestras de registros) solo para enriquecer y ejemplificar, no para cambiar los totales:
+    Contexto (muestras de registros):
     {ctx}
 
-    Pregunta del usuario:
+    Pregunta:
     {question}
-
-    Instrucciones:
-    - Da respuesta directa con los totales y, si corresponde, agrega insights, riesgos y recomendaciones.
-    - Si no hay registros para el filtro, dilo y sugiere alternativas.
-    - Sé claro y breve, con bullets cuando ayude.
     """.strip()
 
-def llm_answer(question: str, context_chunks: List[str], metrics_text: str, filters_info: Dict) -> str:
+def llm_answer(question: str, context_chunks: List[str], metrics: Dict[str, Any]) -> str:
     client = get_openai_client()
     messages = [
-        {"role": "system", "content": "Eres un analista financiero/operacional senior. Respondes en español con precisión."},
-        {"role": "user", "content": build_prompt(context_chunks, question, metrics_text, filters_info)},
+        {"role": "system", "content": system_prompt()},
+        {"role": "user", "content": build_answer_prompt(context_chunks, question, metrics)},
     ]
     with st.spinner("Generando respuesta con LLM…"):
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.2)
+        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.1)
     return resp.choices[0].message.content
 
 def auto_visualize(df_rows: pd.DataFrame, question: str):
@@ -460,17 +537,15 @@ def auto_visualize(df_rows: pd.DataFrame, question: str):
         fig = px.bar(dft, x="__idx__", y=y_col, title=f"Valores de {y_col} (registros recuperados)")
         st.plotly_chart(fig, use_container_width=True)
 
-# ---------------- UI ----------------
-st.title("🔥 Fénix Automotriz — Agente de Negocio (RAG)")
-st.caption("Google Sheets → Filtros deterministas + Recuperación semántica → LLM")
+# ----------------- UI -----------------
+st.title("🔥 Fénix Automotriz — Agente de Negocio (RAG + Planner + Prompts refinados)")
+st.caption("Planner (function-calling) → Filtros deterministas → Contexto semántico → Respuesta guiada por System Prompt")
 
 with st.sidebar:
     st.subheader("⚙️ Parámetros")
-    top_k = st.slider("Máx. fragmentos a recuperar (contexto)", 6, 30, 12, 1)
+    top_k = st.slider("Muestras de contexto (top_k)", 6, 30, 12, 1)
     force_reindex = st.button("🔁 Reconstruir índice")
-    st.markdown("---")
-    st.subheader("🧪 Debug")
-    show_debug = st.checkbox("Mostrar detalles de filtros y métricas", value=False)
+    show_debug = st.checkbox("Mostrar plan y métricas", value=True)
     st.markdown("---")
     st.subheader("📦 Estado")
     st.write("Backend vectorial: **{}**".format("Chroma" if CHROMA_AVAILABLE else "Fallback simple"))
@@ -491,39 +566,34 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-question = st.chat_input("Haz tu pregunta (p. ej.: 'vehículos entregados no facturados en agosto 2024', 'promedio días en planta > 15', 'monto facturado este mes')")
+question = st.chat_input("Ej.: 'no facturados en agosto 2024', 'promedio días en planta > 15', 'monto bruto este mes'")
 if question:
-    # 1) Filtros deterministas
-    mask, finfo = build_mask(df, question)
-    filtered = df[mask].copy()
-    metrics = compute_metrics(filtered)
-    metrics_text = metrics_to_text(metrics)
+    schema = infer_schema(df)
+    plan = llm_make_plan(question, schema)
+    filtered, info = execute_plan(df, plan)
 
-    # 2) Contexto: usa fragmentos de la muestra filtrada si hay; si no, RAG puro
+    # contexto
     if not filtered.empty:
         sample = filtered.sample(min(len(filtered), top_k), random_state=42)
         docs = sample["__fragment__"].tolist()
-        metas = [{"row_id": rid} for rid in sample["__row_id__"].tolist()]
-        row_indices = sample.index.tolist()
+        base_to_show = filtered
     else:
-        docs, metas = retrieve_top_k(question, k=top_k)
-        row_indices = [int(m.get("row_id","0")) for m in metas if "row_id" in m]
+        docs, _ = retrieve_top_k(question, k=top_k)
+        base_to_show = pd.DataFrame()
 
-    sel = df.loc[row_indices].copy() if row_indices else pd.DataFrame()
+    metrics = info.get("metrics", {"cantidad": int(len(filtered))})
+    answer = llm_answer(question, docs, metrics)
 
-    # 3) Responder
-    answer = llm_answer(question, docs, metrics_text, finfo)
     st.session_state.messages += [{"role":"user","content":question},{"role":"assistant","content":answer}]
 
     with st.chat_message("assistant"):
         if show_debug:
-            with st.expander("🔎 Filtros aplicados / Métricas"):
-                st.write(finfo)
-                st.code(metrics_text or "—")
+            with st.expander("🧩 Plan de consulta y métricas"):
+                st.json(plan)
+                st.write(info.get("applied_filters", []))
+                st.json(metrics)
         st.markdown(answer)
 
-        # Tabla y gráficos
-        base_to_show = filtered if not filtered.empty else sel
         if not base_to_show.empty:
             st.markdown("**Registros relevantes (MODELO_BOT):**")
             show_cols = [c for c in CANONICAL_FIELDS if c in base_to_show.columns]
