@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Fénix Automotriz — Agente de Negocio (RAG) en Streamlit
-Fix6: Prompts refinados + planner con guía de dominio + ejecución determinista.
-- System prompt con rol explícito (consultor/analista de Fénix) + misión/visión/procesos.
-- Prompt de consulta con instrucciones estrictas de uso de datos (No inventar / solo planilla).
-- Planner (function-calling) instruido con reglas de negocio para seleccionar columnas de fecha
-  (p.ej., facturación -> FECHA DE FACTURACION) y filtros comunes.
-- Mantiene: credenciales robustas, fallback sin Chroma, visualizaciones, descarga CSV.
+Fix6-Patch: corrige f-string en build_fragments (sin barras invertidas).
+Incluye los mismos cambios de Fix6: prompts robustos + planner determinista.
 """
 import os, re, json, hashlib, math
 from typing import List, Dict, Tuple, Any, Optional
@@ -166,7 +162,8 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
 def build_fragments(df: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in CANONICAL_FIELDS if c in df.columns]
     def row_to_fragment(row: pd.Series) -> str:
-        return " | ".join([f\"{c}: {row.get(c, '')}\" for c in cols])
+        # >>> FIX AQUÍ: f-string sin escapar comillas
+        return " | ".join([f"{c}: {row.get(c, '')}" for c in cols])
     df = df.copy()
     df["__fragment__"] = df.apply(row_to_fragment, axis=1)
     df["__row_id__"] = df.index.astype(str)
@@ -196,7 +193,6 @@ def get_openai_client() -> OpenAI:
         st.stop()
     return OpenAI(api_key=api_key)
 
-# System Prompt reforzado (rol + reglas)
 def system_prompt() -> str:
     return f"""
     Eres un CONSULTOR DE GESTIÓN y ANALISTA DE DATOS para Fénix Automotriz.
@@ -227,7 +223,7 @@ def embed_texts(client: OpenAI, texts: List[str], model: str = "text-embedding-3
         out.extend([d.embedding for d in resp.data])
     return out
 
-# ----------------- Vector index -----------------
+# ----------------- Vector index (igual que Fix6) -----------------
 def ensure_index(df: pd.DataFrame):
     current_hash = hash_dataframe(df)
     if "index_hash" not in st.session_state or st.session_state.index_hash != current_hash:
@@ -286,7 +282,7 @@ def retrieve_top_k(query: str, k: int = 12):
         metas = [{"row_id": st.session_state.simple_ids[i]} for i in idx]
         return docs, metas
 
-# ----------------- Planner (function-calling) -----------------
+# ----------------- Planner idéntico a Fix6 -----------------
 def infer_schema(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     schema = {}
     for c in df.columns:
@@ -318,8 +314,7 @@ def llm_make_plan(question: str, schema: Dict[str, Dict[str, Any]]) -> Dict[str,
     schema_json = json.dumps(schema)[:6000]
     system = (
         "Eres un planificador de consultas para datos tabulares de Fénix Automotriz. "
-        "Debes devolver un PLAN JSON (filters/aggregations/group_by) que otro componente ejecutará en Pandas. "
-        "No incluyas explicación; solo el JSON a través de la función."
+        "Devuelve un PLAN JSON a través de la función; no expliques."
     )
     user = f"Esquema:\n{schema_json}\n\n{rules}\n\nPregunta del usuario:\n{question}"
     tools = [{
@@ -397,7 +392,6 @@ def execute_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[pd.DataFrame, 
     info = {"plan": plan, "applied_filters": []}
     cols = [c for c in df.columns if not c.startswith("__")]
 
-    # aplicar filtros
     for f in plan.get("filters", []):
         col = map_column_name(str(f.get("column","")), cols)
         op = f.get("op","")
@@ -445,7 +439,6 @@ def execute_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[pd.DataFrame, 
 
     filtered = df[mask].copy()
 
-    # agregaciones
     aggs = plan.get("aggregations") or [{"op":"count","alias":"cantidad"}]
     out = {"cantidad": len(filtered)}
     for a in aggs:
@@ -572,7 +565,6 @@ if question:
     plan = llm_make_plan(question, schema)
     filtered, info = execute_plan(df, plan)
 
-    # contexto
     if not filtered.empty:
         sample = filtered.sample(min(len(filtered), top_k), random_state=42)
         docs = sample["__fragment__"].tolist()
