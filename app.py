@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Consulta Nexa IA — Fénix Automotriz
-UI con marca (login, sidebar, iconos chat, métricas, análisis) + manejo robusto de assets.
-⚠️ La lógica RAG/filtrado permanece intacta.
+UI + marca (login, sidebar, iconos chat, métricas, análisis) y
+AGREGACIÓN/CONTEO preciso sobre pandas antes del LLM.
 """
 
 import os, re, json, hashlib, datetime as dt
@@ -23,14 +23,8 @@ from openai import OpenAI
 ASSETS_DIR = "assets"
 
 def asset(name: str) -> Optional[str]:
-    """
-    Devuelve la primera ruta disponible:
-    - raíz del repo (main)
-    - ./assets
-    - /mnt/data (entorno de pruebas)
-    """
     candidates = [
-        name,
+        name,  # raíz del repo
         os.path.join(ASSETS_DIR, name),
         os.path.join("/mnt/data", name),
     ]
@@ -40,10 +34,6 @@ def asset(name: str) -> Optional[str]:
     return None
 
 def safe_image(name_or_path: str, **kwargs) -> bool:
-    """
-    Muestra una imagen si existe (sin crashear). Usa use_container_width (no use_column_width).
-    Devuelve True si se mostró.
-    """
     path = asset(name_or_path) or name_or_path
     if path and os.path.exists(path):
         kwargs.pop("use_column_width", None)  # deprecado
@@ -82,37 +72,18 @@ def apply_theme(name: str):
     st.markdown(
         f"""
         <style>
-        :root {{
-            --nexa-primary: {primary};
-        }}
-        .stButton>button {{
+        :root {{ --nexa-primary: {primary}; }}
+        .stButton>button, .stDownloadButton>button {{
             background-color: var(--nexa-primary) !important;
             color: white !important;
-            border-radius: .6rem;
-            border: 0;
-        }}
-        .stDownloadButton>button {{
-            background-color: var(--nexa-primary) !important;
-            color: white !important;
-            border-radius: .6rem;
-            border: 0;
+            border-radius: .6rem; border: 0;
         }}
         .stTextInput>div>div>input, .stSelectbox>div>div>select, .stNumberInput input {{
-            border: 1px solid {primary}33 !important;
-            border-radius: .5rem !important;
+            border: 1px solid {primary}33 !important; border-radius: .5rem !important;
         }}
-        .stMetric>div>div {{
-            background: {primary}0D; 
-            border-radius: .75rem;
-            padding: .25rem .5rem;
-        }}
-        .nexa-topbar {{
-            display: flex; align-items:center; justify-content:flex-end;
-            gap: 10px;
-        }}
-        .nexa-footer {{
-            text-align:center; opacity:.7; padding: 24px 0;
-        }}
+        .stMetric>div>div {{ background: {primary}0D; border-radius: .75rem; padding: .25rem .5rem; }}
+        .nexa-topbar {{ display:flex; align-items:center; justify-content:flex-end; gap:10px; }}
+        .nexa-footer {{ text-align:center; opacity:.7; padding:24px 0; }}
         </style>
         """,
         unsafe_allow_html=True
@@ -151,7 +122,7 @@ def login_view():
                 st.error("Usuario o contraseña inválidos.")
 
 # =========================
-#   LÓGICA RAG (SIN CAMBIOS)
+#   LÓGICA RAG (BASE)
 # =========================
 CHROMA_AVAILABLE = True
 try:
@@ -407,6 +378,9 @@ def llm_answer(question: str, docs: List[str]):
     resp=client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.2)
     return resp.choices[0].message.content, messages
 
+# =========================
+#  PARSER DE INTENCIÓN (FILTROS)
+# =========================
 def infer_schema_for_llm(df: pd.DataFrame) -> Dict[str,Any]:
     schema={}
     for c in df.columns:
@@ -457,6 +431,148 @@ def llm_parse_intent(question: str, df: pd.DataFrame) -> Dict[str,Any]:
         pass
     return out
 
+# =========================
+#  PARSER Y EJECUCIÓN DE AGREGACIÓN
+# =========================
+def is_counting_question(q: str) -> bool:
+    qn=_norm(q)
+    keys=["cuantos","cuántos","cuantas","cuántas","numero de","número de",
+          "cantidad de","conteo","count","veces","repite","duplicad","duplicada","duplicadas"]
+    return any(k in qn for k in keys)
+
+def llm_parse_aggregation(question: str, df: pd.DataFrame) -> Dict[str,Any]:
+    """
+    Devuelve una especificación de agregación:
+    {
+      kind: "count" | "value_counts" | "groupby_count" | "duplicates",
+      column: "PATENTE" | ... (opcional),
+      non_empty_column: "NUMERO DE FACTURA" (opcional),
+      groupby: ["TIPO CLIENTE"] (opcional),
+      filters: [ ... ]  # filtros adicionales exactos (mismo formato que llm_parse_intent)
+    }
+    """
+    if not is_counting_question(question):
+        return {}
+
+    client=get_openai_client()
+    schema=json.dumps(infer_schema_for_llm(df))
+    system = (
+        "Eres un parser de agregaciones. A partir de una pregunta en español, "
+        "detecta si se requiere conteo/agrupación y devuelve una especificación estructurada. "
+        "Preferir 'duplicates' cuando se pregunte por 'duplicadas/duplicado'. "
+        "Si preguntan por facturas emitidas, usa non_empty_column='NUMERO DE FACTURA'."
+    )
+    user = f"Esquema de columnas:\n{schema}\n\nPregunta:\n{question}\n\nDevuelve SOLO parámetros de la función."
+    tools=[{
+        "type":"function",
+        "function":{
+            "name":"emitir_agregacion",
+            "description":"Especificación de agregación/tablas de conteo.",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string","enum":["count","value_counts","groupby_count","duplicates"]},
+                    "column":{"type":["string","null"]},
+                    "groupby":{"type":"array","items":{"type":"string"}},
+                    "non_empty_column":{"type":["string","null"]},
+                    "filters":{"type":"array","items":{"type":"object","properties":{
+                        "column":{"type":"string"},
+                        "op":{"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","not_contains","in","not_in","empty","not_empty","between_dates"]},
+                        "value":{"type":"array","items":{"type":"string"}}
+                    },"required":["column","op"]}}
+                },
+                "required":["kind"]
+            }
+        }
+    }]
+    resp=client.chat.completions.create(
+        model="gpt-4o-mini", temperature=0,
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        tools=tools, tool_choice={"type":"function","function":{"name":"emitir_agregacion"}}
+    )
+    msg=resp.choices[0].message
+    out={}
+    try:
+        if msg.tool_calls:
+            out=json.loads(msg.tool_calls[0].function.arguments)
+    except Exception:
+        out={}
+    return out
+
+def _non_empty_mask(series: pd.Series) -> pd.Series:
+    return ~(series.isna() | (series.astype(str).str.strip()=="") |
+             (series.astype(str).str.upper().isin(["NAN","NONE","NULL","-"])))
+
+def perform_aggregation(df: pd.DataFrame, spec: Dict[str,Any]) -> Tuple[str, Optional[pd.DataFrame]]:
+    """
+    Ejecuta la agregación en pandas y devuelve (texto_resumen, df_resultado | None).
+    """
+    if not spec or df.empty:
+        return "", None
+
+    # 1) filtros adicionales si vienen en la spec
+    filters=spec.get("filters", [])
+    if filters:
+        df, _ = apply_filters(df, filters)
+
+    kind = spec.get("kind")
+    col  = spec.get("column")
+    groupby = spec.get("groupby", []) or []
+    non_empty_col = spec.get("non_empty_column")
+
+    # normalización de nombres
+    if col:       col = _map_col(col, list(df.columns))
+    if non_empty_col: non_empty_col = _map_col(non_empty_col, list(df.columns))
+    groupby = [_map_col(g, list(df.columns)) for g in groupby if _map_col(g, list(df.columns))]
+
+    # aplicar non_empty_column si se requiere (ej. facturas emitidas)
+    if non_empty_col and non_empty_col in df.columns:
+        df = df[_non_empty_mask(df[non_empty_col])]
+
+    if df.empty:
+        return "No se encontraron filas que coincidan con la búsqueda.", None
+
+    # 2) ejecución
+    if kind == "duplicates":
+        # usa 'column' o intenta PATENTE por defecto
+        col = col or ("PATENTE" if "PATENTE" in df.columns else None)
+        if not col:
+            return "No se encontró columna para identificar duplicados.", None
+        valid = df[_non_empty_mask(df[col])]
+        vc = valid[col].value_counts(dropna=True)
+        dup = vc[vc > 1]
+        if dup.empty:
+            return f"No hay valores duplicados en **{col}**.", None
+        out = dup.reset_index().rename(columns={"index": col, col: "CANTIDAD"})
+        resumen = f"Hay **{out.shape[0]}** valores duplicados en **{col}** (se muestran sus repeticiones)."
+        return resumen, out
+
+    if kind == "value_counts":
+        col = col or ("PATENTE" if "PATENTE" in df.columns else None)
+        if not col:
+            return "No se indicó columna para conteo.", None
+        vc = df[col].value_counts(dropna=False).reset_index()
+        vc.columns=[col, "CANTIDAD"]
+        return f"Conteo por valores de **{col}**.", vc
+
+    if kind == "groupby_count" and groupby:
+        g = df.groupby(groupby, dropna=False).size().reset_index(name="CANTIDAD")
+        g = g.sort_values("CANTIDAD", ascending=False)
+        return f"Conteo por {', '.join(groupby)}.", g
+
+    # default: conteo simple de filas (opcional por valor en 'col')
+    if kind == "count":
+        if col and col in df.columns:
+            n = int(_non_empty_mask(df[col]).sum())
+            return f"Total de filas con **{col}** no vacío: **{n}**.", None
+        n = int(df.shape[0])
+        return f"Total de filas que cumplen los criterios: **{n}**.", None
+
+    return "", None
+
+# =========================
+#  FECHAS / FILTROS EXACTOS
+# =========================
 def choose_date_column(question: str, df: pd.DataFrame) -> Optional[str]:
     q=_norm(question); pref=[]
     if "pago" in q or "pagar" in q: pref+=["FECHA DE PAGO FACTURA"]
@@ -482,11 +598,6 @@ def parse_explicit_month_year(question: str) -> Tuple[Optional[int], Optional[in
             year=int(m.group(0)) if m else None
             return num, year, name
     return None, None, None
-
-def month_to_range(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    start = pd.Timestamp(year=year, month=month, day=1)
-    end = pd.Timestamp(year=year, month=month, day=monthrange(year, month)[1])
-    return start, end
 
 def apply_month_filter_first(df: pd.DataFrame, month: int, year: int, date_col: str) -> pd.DataFrame:
     if date_col not in df.columns: return pd.DataFrame()
@@ -641,7 +752,7 @@ df=normalize_df(raw_df)
 #      SIDEBAR / NAV
 # =========================
 with st.sidebar:
-    safe_image("Nexa_logo.png")  # logo en sidebar
+    safe_image("Nexa_logo.png")
     st.markdown("---")
     nav = st.radio("Navegación", ["Consulta IA", "Análisis de negocio", "Configuración", "Diagnóstico y uso", "Soporte"], index=0)
     st.markdown("---")
@@ -696,8 +807,7 @@ def page_chat():
     if not question:
         return
 
-    # ===== Pipeline =====
-    # 1) Analizador de MES — PRIMARIO
+    # ===== 1) Mes explícito (primario) =====
     month_num, year_num, month_token = parse_explicit_month_year(question)
     month_mode = month_num is not None
     used_month_col = None
@@ -713,7 +823,7 @@ def page_chat():
         year_num = year_num if year_num else dt.date.today().year
         subset_df = apply_month_filter_first(df, month_num, year_num, used_month_col)
 
-    # 2) Intent parser (secundario)
+    # ===== 2) Filtros del LLM =====
     base_for_filters = subset_df if month_mode else df
     llm_filters = llm_parse_intent(question, base_for_filters)
     extracted = llm_filters.get("filters", [])
@@ -722,9 +832,9 @@ def page_chat():
     if not month_mode and detect_future_intent(question):
         extracted, used_date_col = enforce_future_guardrail(extracted, base_for_filters, question)
 
-    # 3) Filtros exactos
     filtered_df, filter_log = apply_filters(base_for_filters, extracted)
 
+    # reforzar mes / futuro si aplica
     if month_mode and not subset_df.empty and used_month_col in filtered_df.columns:
         s = filtered_df[used_month_col]
         if not pd.api.types.is_datetime64_any_dtype(s):
@@ -736,14 +846,33 @@ def page_chat():
         s = filtered_df[used_date_col]
         filtered_df = filtered_df[s.isna() | (s >= today_ts)]
 
-    if month_mode:
-        final_subset = filtered_df
-    else:
-        if detect_future_intent(question):
-            final_subset = filtered_df
-        else:
-            final_subset = filtered_df if not filtered_df.empty else df
+    final_subset = filtered_df if (month_mode or detect_future_intent(question) or not filtered_df.empty) else df
 
+    # ===== 3) Nuevo: Agregación/Conteo directo =====
+    agg_spec = llm_parse_aggregation(question, final_subset)
+    if agg_spec:
+        summary_text, table = perform_aggregation(final_subset.copy(), agg_spec)
+        st.session_state.stats["queries"] += 1
+        st.session_state.stats["tokens_est"] += estimate_tokens(question, summary_text)
+        st.session_state.messages += [{"role":"user","content":question},
+                                      {"role":"assistant","content":summary_text}]
+        with st.chat_message("assistant", avatar=BOT_AVATAR):
+            if show_diag:
+                with st.expander("🧭 Diagnóstico", expanded=False):
+                    st.write("**Mes detectado**:", {"month": month_num, "year": year_num, "date_col": used_month_col})
+                    st.write("**Filtros del LLM**:", extracted)
+                    st.write("**Spec de agregación**:", agg_spec)
+                    st.write("**Filas en subconjunto**:", len(final_subset))
+            st.markdown(summary_text)
+            if table is not None and not isinstance(table, str):
+                st.dataframe(table, use_container_width=True, hide_index=True)
+            # Auditoría opcional del subset
+            with st.expander("Subconjunto base (auditoría)"):
+                show_cols=[c for c in CANONICAL_FIELDS if c in final_subset.columns]
+                st.dataframe(final_subset[show_cols] if show_cols else final_subset, use_container_width=True, hide_index=True)
+        return  # fin: no usamos LLM generativo para estos casos
+
+    # ===== 4) RAG normal =====
     frags, ids = make_fragments(final_subset)
     if force_index:
         for k in ["subset_index_hash","subset_collection","subset_embs","subset_ids","subset_docs","subset_backend"]:
@@ -845,9 +974,6 @@ def page_support():
 # =========================
 #      ROUTER DE PÁGINA
 # =========================
-with st.sidebar:
-    nav = nav  # ya definido antes
-
 if nav == "Consulta IA":
     page_chat()
 elif nav == "Análisis de negocio":
