@@ -51,7 +51,7 @@ def safe_page_icon(name: str, default="🔥"):
 # =========================
 st.set_page_config(
     page_title="Consulta Nexa IA",
-    page_icon=safe_page_icon("nexa_favicon.ico"),
+    page_icon=safe_page_icon("Isotipo_Nexa.png"),  # ← ÚNICO CAMBIO: favicon
     layout="wide",
 )
 
@@ -441,16 +441,6 @@ def is_counting_question(q: str) -> bool:
     return any(k in qn for k in keys)
 
 def llm_parse_aggregation(question: str, df: pd.DataFrame) -> Dict[str,Any]:
-    """
-    Devuelve una especificación de agregación:
-    {
-      kind: "count" | "value_counts" | "groupby_count" | "duplicates",
-      column: "PATENTE" | ... (opcional),
-      non_empty_column: "NUMERO DE FACTURA" (opcional),
-      groupby: ["TIPO CLIENTE"] (opcional),
-      filters: [ ... ]  # filtros adicionales exactos (mismo formato que llm_parse_intent)
-    }
-    """
     if not is_counting_question(question):
         return {}
 
@@ -504,13 +494,9 @@ def _non_empty_mask(series: pd.Series) -> pd.Series:
              (series.astype(str).str.upper().isin(["NAN","NONE","NULL","-"])))
 
 def perform_aggregation(df: pd.DataFrame, spec: Dict[str,Any]) -> Tuple[str, Optional[pd.DataFrame]]:
-    """
-    Ejecuta la agregación en pandas y devuelve (texto_resumen, df_resultado | None).
-    """
     if not spec or df.empty:
         return "", None
 
-    # 1) filtros adicionales si vienen en la spec
     filters=spec.get("filters", [])
     if filters:
         df, _ = apply_filters(df, filters)
@@ -520,21 +506,17 @@ def perform_aggregation(df: pd.DataFrame, spec: Dict[str,Any]) -> Tuple[str, Opt
     groupby = spec.get("groupby", []) or []
     non_empty_col = spec.get("non_empty_column")
 
-    # normalización de nombres
     if col:       col = _map_col(col, list(df.columns))
     if non_empty_col: non_empty_col = _map_col(non_empty_col, list(df.columns))
     groupby = [_map_col(g, list(df.columns)) for g in groupby if _map_col(g, list(df.columns))]
 
-    # aplicar non_empty_column si se requiere (ej. facturas emitidas)
     if non_empty_col and non_empty_col in df.columns:
         df = df[_non_empty_mask(df[non_empty_col])]
 
     if df.empty:
         return "No se encontraron filas que coincidan con la búsqueda.", None
 
-    # 2) ejecución
     if kind == "duplicates":
-        # usa 'column' o intenta PATENTE por defecto
         col = col or ("PATENTE" if "PATENTE" in df.columns else None)
         if not col:
             return "No se encontró columna para identificar duplicados.", None
@@ -560,7 +542,6 @@ def perform_aggregation(df: pd.DataFrame, spec: Dict[str,Any]) -> Tuple[str, Opt
         g = g.sort_values("CANTIDAD", ascending=False)
         return f"Conteo por {', '.join(groupby)}.", g
 
-    # default: conteo simple de filas (opcional por valor en 'col')
     if kind == "count":
         if col and col in df.columns:
             n = int(_non_empty_mask(df[col]).sum())
@@ -848,7 +829,7 @@ def page_chat():
 
     final_subset = filtered_df if (month_mode or detect_future_intent(question) or not filtered_df.empty) else df
 
-    # ===== 3) Nuevo: Agregación/Conteo directo =====
+    # ===== 3) Agregación/Conteo directo =====
     agg_spec = llm_parse_aggregation(question, final_subset)
     if agg_spec:
         summary_text, table = perform_aggregation(final_subset.copy(), agg_spec)
@@ -866,11 +847,10 @@ def page_chat():
             st.markdown(summary_text)
             if table is not None and not isinstance(table, str):
                 st.dataframe(table, use_container_width=True, hide_index=True)
-            # Auditoría opcional del subset
             with st.expander("Subconjunto base (auditoría)"):
                 show_cols=[c for c in CANONICAL_FIELDS if c in final_subset.columns]
                 st.dataframe(final_subset[show_cols] if show_cols else final_subset, use_container_width=True, hide_index=True)
-        return  # fin: no usamos LLM generativo para estos casos
+        return
 
     # ===== 4) RAG normal =====
     frags, ids = make_fragments(final_subset)
