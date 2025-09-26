@@ -51,7 +51,7 @@ def safe_page_icon(name: str, default="🔥"):
 # =========================
 st.set_page_config(
     page_title="Consulta Nexa IA",
-    page_icon=safe_page_icon("Isotipo_Nexa.png"),  # ← ÚNICO CAMBIO: favicon
+    page_icon=safe_page_icon("Isotipo_Nexa.png"),  # favicon desde raíz o assets
     layout="wide",
 )
 
@@ -154,6 +154,14 @@ COL_ALIASES = {
     "entrega": "FECHA ENTREGA", "numero factura": "NUMERO DE FACTURA", "nro factura": "NUMERO DE FACTURA",
     "n° factura": "NUMERO DE FACTURA", "cliente": "NOMBRE CLIENTE",
 }
+# Alias adicionales por variantes frecuentes
+COL_ALIASES.update({
+    "fecha de entrega": "FECHA ENTREGA",
+    "fecha inspeccion": "FECHA INSPECCIÓN",
+    "fecha de recepcion": "FECHA RECEPCION",
+    "tipo de vehiculo": "TIPO VEHÍCULO",
+})
+
 DATE_FIELDS = [
     "FECHA INGRESO PLANTA","FECHA SALIDA PLANTA","FECHA INSPECCIÓN",
     "FECHA RECEPCION","FECHA ENTREGA","FECHA DE FACTURACION","FECHA DE PAGO FACTURA",
@@ -175,9 +183,16 @@ SPANISH_MONTHS = {
     "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
     "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
 }
+SPANISH_MONTHS_ABBR = {
+    "ene":1,"feb":2,"mar":3,"abr":4,"may":5,"jun":6,
+    "jul":7,"ago":8,"sep":9,"set":9,"oct":10,"nov":11,"dic":12
+}
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", unidecode(str(s)).strip().lower())
+
+def norm_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).map(lambda x: _norm(x))
 
 def _fmt_value(v) -> str:
     if pd.isna(v): return ""
@@ -357,19 +372,43 @@ def retrieve_top_subset(query: str, k=6) -> Tuple[List[str], List[str]]:
     idx=np.argsort(-(An@qn).ravel())[:k]
     return [st.session_state.subset_docs[i] for i in idx], [st.session_state.subset_ids[i] for i in idx]
 
+# =========================
+#  PROMPTS (REFORMULADOS)
+# =========================
 def system_prompt() -> str:
     return f"""
 Eres un CONSULTOR DE GESTIÓN y ANALISTA DE DATOS para Fénix Automotriz.
-Usa EXCLUSIVAMENTE el “Contexto proporcionado” (ya filtrado: MES cuando aplique y/o FECHAS ≥ HOY).
-Si falta información, responde: "No tengo la información necesaria en los datos".
-Cuando la pregunta implique montos, calcula y muestra la SUMA TOTAL.
-Contexto:
+
+--- INSTRUCCIONES CLAVE DE RAZONAMIENTO ---
+1. INTERPRETACIÓN FLEXIBLE: Responde con precisión a la pregunta, sin importar la formulación. 
+   - Si preguntan “¿La OT X está lista?”, interpreta que debes revisar si el campo 'ESTADO SERVICIO' equivale a 'ENTREGADO', 'FINALIZADO', 'TERMINADO' u otras variantes.
+   - Si preguntan “¿La patente XYZ ya fue facturada?”, traduce a verificar 'FACTURADO' = 'SI' o la existencia de 'NUMERO DE FACTURA' y/o 'FECHA DE FACTURACION'.
+2. SINÓNIMOS Y CAMPOS RELACIONADOS:
+   - “listo/terminado/entregado/finalizado” → 'ESTADO SERVICIO' (valores equivalentes).
+   - “espera/parado/pendiente” → 'ESTADO SERVICIO' o 'PROCESO' según contexto.
+   - “aprobado/presupuesto/aprobación” → 'ESTADO PRESUPUESTO'.
+   - “por pagar/pendiente de pago/vencimiento” → 'FECHA DE PAGO FACTURA'.
+3. USO DE CONTEXTO: Usa EXCLUSIVAMENTE el Contexto proporcionado (ya filtrado: MES y/o FECHAS ≥ HOY). No inventes.
+   - Si falta información, responde: "No tengo la información necesaria en los datos".
+4. AGREGACIÓN: Cuando la pregunta implique montos (neto/bruto/iva/facturación), calcula y muestra la SUMA TOTAL.
+5. PASOS DE RAZONAMIENTO: Antes de responder, realiza mentalmente:
+   a) Identifica la intención y los campos involucrados (p. ej., estado, fechas, facturación).
+   b) Traduce sinónimos del usuario a los valores exactos de las columnas.
+   c) Apóyate solo en el contexto dado y, si no alcanza, dilo explícitamente.
+
+Contexto de Negocio Fénix:
 {BUSINESS_CONTEXT}
 """.strip()
 
 def build_user_prompt(question: str, context_docs: List[str]) -> str:
-    ctx="\n\n-----\n\n".join(context_docs) if context_docs else "(sin contexto)"
-    return f"Pregunta: {question}\n\nContexto proporcionado (subconjunto filtrado estrictamente):\n{ctx}"
+    ctx = "\n\n-----\n\n".join(context_docs) if context_docs else "(sin contexto)"
+    instruction = (
+        "Analiza el contexto, interpreta la intención del usuario y genera una respuesta profesional y precisa, "
+        "traduciendo el lenguaje del usuario a la terminología y a los valores de columnas de Fénix Automotriz. "
+        "Si el usuario usa expresiones coloquiales (p. ej., 'listo', 'por pagar'), conviértelas a los campos y valores exactos. "
+        "No salgas del contexto dado."
+    )
+    return f"{instruction}\n\nContexto proporcionado (subconjunto filtrado estrictamente):\n{ctx}\n\nPregunta del usuario: {question}"
 
 def llm_answer(question: str, docs: List[str]):
     client=get_openai_client()
@@ -437,7 +476,8 @@ def llm_parse_intent(question: str, df: pd.DataFrame) -> Dict[str,Any]:
 def is_counting_question(q: str) -> bool:
     qn=_norm(q)
     keys=["cuantos","cuántos","cuantas","cuántas","numero de","número de",
-          "cantidad de","conteo","count","veces","repite","duplicad","duplicada","duplicadas"]
+          "cantidad de","conteo","count","veces","se repite","repite","repetidas",
+          "duplicad","duplicada","duplicadas","duplicidad"]
     return any(k in qn for k in keys)
 
 def llm_parse_aggregation(question: str, df: pd.DataFrame) -> Dict[str,Any]:
@@ -568,7 +608,9 @@ def choose_date_column(question: str, df: pd.DataFrame) -> Optional[str]:
 
 def detect_future_intent(question: str) -> bool:
     q=_norm(question)
-    keys=["proxim","próxim","pronto","futuro","en adelante","desde hoy","a partir de hoy","hoy en adelante","venider"]
+    keys=["proxim","próxim","pronto","futuro","en adelante","desde hoy","a partir de hoy",
+          "hoy en adelante","pendiente de pago","pendientes de pago","por pagar","a pagar",
+          "vencen","vencimiento","por vencer"]
     return any(k in q for k in keys)
 
 def parse_explicit_month_year(question: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
@@ -578,6 +620,11 @@ def parse_explicit_month_year(question: str) -> Tuple[Optional[int], Optional[in
             m=re.search(r"(19|20)\d{2}", q)
             year=int(m.group(0)) if m else None
             return num, year, name
+    for abbr, num in SPANISH_MONTHS_ABBR.items():
+        if re.search(rf"\b{abbr}\b\.?", q):
+            m=re.search(r"(19|20)\d{2}", q)
+            year=int(m.group(0)) if m else None
+            return num, year, abbr
     return None, None, None
 
 def apply_month_filter_first(df: pd.DataFrame, month: int, year: int, date_col: str) -> pd.DataFrame:
@@ -737,6 +784,12 @@ with st.sidebar:
     st.markdown("---")
     nav = st.radio("Navegación", ["Consulta IA", "Análisis de negocio", "Configuración", "Diagnóstico y uso", "Soporte"], index=0)
     st.markdown("---")
+    if st.button("🔄 Actualizar datos"):
+        get_data_from_gsheet.clear()
+        for k in ["subset_index_hash","subset_collection","subset_embs","subset_ids","subset_docs","subset_backend"]:
+            st.session_state.pop(k, None)
+        st.experimental_rerun()
+    st.markdown("---")
     if st.session_state.authed:
         if st.button("Cerrar sesión"):
             st.session_state.authed = False
@@ -853,6 +906,13 @@ def page_chat():
         return
 
     # ===== 4) RAG normal =====
+    if final_subset.empty:
+        msg = "No se encontraron datos que coincidan con la búsqueda."
+        st.session_state.messages += [{"role":"user","content":question},{"role":"assistant","content":msg}]
+        with st.chat_message("assistant", avatar=BOT_AVATAR):
+            st.warning(msg)
+        return
+
     frags, ids = make_fragments(final_subset)
     if force_index:
         for k in ["subset_index_hash","subset_collection","subset_embs","subset_ids","subset_docs","subset_backend"]:
@@ -969,3 +1029,4 @@ elif nav == "Soporte":
 #          FOOTER
 # =========================
 st.markdown('<div class="nexa-footer">Desarrollado por Nexa Corp. todos los derechos reservados.</div>', unsafe_allow_html=True)
+
