@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Consulta Nexa IA — Fénix Automotriz
-RAG de Dos Pasos con Parser de Tiempo a prueba de errores:
-- convertimos TODAS las columnas de fecha a datetime (y a .date) antes de filtrar
-- today = datetime.date.today() como referencia única
-- comparaciones robustas con NaN (no rompen el filtro)
+RAG de Dos Pasos con manejo universal de fechas:
+- Conversión única de todas las columnas de fecha a datetime.date al cargar
+- apply_filters con comparaciones robustas (futuro, pasado, mes, rangos) en cualquier columna de fecha
 """
 
 import os, re, json, hashlib
@@ -128,10 +127,13 @@ CANONICAL_FIELDS = [
     "FECHA DE FACTURACION","FECHA DE PAGO FACTURA","FACTURADO","NUMERO DE DIAS EN PLANTA","DIAS EN DOMINIO",
     "CANTIDAD DE VEHICULO","DIAS DE PAGO DE FACTURA",
 ]
+
+# UNIVERSAL: columnas de fecha (todas las que deberían tratarse como fechas)
 DATE_FIELDS = [
     "FECHA INGRESO PLANTA","FECHA SALIDA PLANTA","FECHA INSPECCIÓN",
     "FECHA RECEPCION","FECHA ENTREGA","FECHA DE FACTURACION","FECHA DE PAGO FACTURA",
 ]
+
 NUM_FIELDS = [
     "MONTO PRINCIPAL NETO","IVA PRINCIPAL [F]","MONTO PRINCIPAL BRUTO [F]",
     "NUMERO DE DIAS EN PLANTA","DIAS EN DOMINIO","CANTIDAD DE VEHICULO","DIAS DE PAGO DE FACTURA",
@@ -218,10 +220,11 @@ def today_chile() -> pd.Timestamp:
             return n.normalize()
 
 TODAY_TS = today_chile()           # Timestamp (zona CL normalizada)
-TODAY_DATE = dt.date.today()       # date() — pedido explícito para comparaciones
+TODAY_DATE = dt.date.today()       # date() — comparaciones simples
 
 def ensure_datetime_series(s: pd.Series) -> pd.Series:
-    return s if pd.api.types.is_datetime64_any_dtype(s) else pd.to_datetime(s, errors="coerce", dayfirst=True)
+    # Convierte Series a datetime64; útil para sacar .dt.month aunque sea date
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
 def month_range_boundaries(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
     start = pd.Timestamp(year=int(year), month=int(month), day=1)
@@ -322,6 +325,7 @@ def get_data_from_gsheet() -> pd.DataFrame:
     return pd.DataFrame(rec) if rec else pd.DataFrame()
 
 def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza nombres, números y —UNIVERSAL— convierte fechas a datetime.date una sola vez."""
     if raw.empty: return raw.copy()
     mapping={}
     for c in raw.columns:
@@ -330,10 +334,12 @@ def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
             if _norm(can)==key: mapping[c]=can
         if key in COL_ALIASES: mapping[c]=COL_ALIASES[key]
     df=raw.rename(columns=mapping).copy()
-    # Fechas a datetime (coerce)
+
+    # --- UNIVERSAL: convertir TODAS las columnas de fecha a datetime.date (errors='coerce') ---
     for col in DATE_FIELDS:
         if col in df.columns:
-            df[col]=pd.to_datetime(df[col], errors="coerce", dayfirst=True, infer_datetime_format=True)
+            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True).dt.date
+
     # Números
     for col in NUM_FIELDS:
         if col in df.columns:
@@ -342,6 +348,7 @@ def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
                         .str.replace(".","",regex=False)
                         .str.replace(",",".",regex=False))
             df[col]=pd.to_numeric(df[col], errors="coerce")
+
     # Facturado normalizado
     if "FACTURADO" in df.columns:
         df["FACTURADO"]=(df["FACTURADO"].astype(str).str.strip().str.upper()
@@ -364,7 +371,8 @@ def infer_schema_for_llm(df: pd.DataFrame) -> Dict[str,Any]:
     schema={}
     for c in df.columns:
         s=df[c]
-        if pd.api.types.is_datetime64_any_dtype(s): schema[c]="date"
+        if pd.api.types.is_datetime64_any_dtype(pd.to_datetime(s, errors="coerce")) or c in DATE_FIELDS:
+            schema[c]="date"
         elif pd.api.types.is_numeric_dtype(s):     schema[c]="number"
         else:                                      schema[c]="text"
     return schema
@@ -399,7 +407,7 @@ def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
                 "properties":{
                     "filters":{"type":"array","items":{"type":"object","properties":{
                         "column":{"type":"string"},
-                        "op":{"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","not_contains","in","not_in","empty","not_empty","between_dates","month_eq"]},
+                        "op":{"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","not_contains","in","not_in","empty","not_empty","between_dates","month_eq","future","gte_today","past","lt_today"]},
                         "value":{"type":"array","items":{"type":"string"}}
                     },"required":["column","op"]}},
                     "temporal_intent":{"type":["string","null"],"enum":["future","past",None]},
@@ -432,6 +440,11 @@ def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
 # =========================
 #  ENFORCER DE TIEMPO (central)
 # =========================
+def month_range_boundaries_dates(year: int, month: int) -> Tuple[dt.date, dt.date]:
+    start = dt.date(int(year), int(month), 1)
+    end   = dt.date(int(year), int(month), monthrange(int(year), int(month))[1])
+    return start, end
+
 def time_enforcer_attach(question: str, spec: Dict[str,Any], df: pd.DataFrame) -> Tuple[Dict[str,Any], Dict[str,Any]]:
     diag = {"temporal": None, "month": None, "year": None, "date_col": None, "added": []}
     spec = dict(spec); spec_filters = list(spec.get("filters") or [])
@@ -439,46 +452,43 @@ def time_enforcer_attach(question: str, spec: Dict[str,Any], df: pd.DataFrame) -
     if date_col and date_col not in df.columns:
         date_col = None
 
-    # Próximos X días
     ndays = parse_next_days_from_text(question)
     if ndays and not date_col:
         date_col = choose_date_column_by_context(question, df)
     if ndays and date_col:
-        start = TODAY_TS
-        end = TODAY_TS + pd.Timedelta(days=int(ndays))
-        spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) == date_col and f.get("op") in ("between_dates","gte","gt","lt","lte") and False] + \
-                       [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
+        start = TODAY_DATE
+        end   = TODAY_DATE + dt.timedelta(days=int(ndays))
+        spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
         spec_filters.append({"column": date_col, "op":"between_dates",
-                             "value":[start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]})
-        diag.update({"temporal":"next_days","date_col":date_col,"added":diag["added"]+[{"type":"next_days","start":str(start.date()),"end":str(end.date())}]})
+                             "value":[start.isoformat(), end.isoformat()]})
+        diag.update({"temporal":"next_days","date_col":date_col,"added":diag["added"]+[{"type":"next_days","start":str(start),"end":str(end)}]})
 
     # Mes explícito
     m, y, token = parse_month_year_from_text(question)
     if m is not None:
-        if y is None: y = TODAY_TS.year
+        if y is None: y = TODAY_DATE.year
         if not date_col:
             date_col = choose_date_column_by_context(question, df)
         if date_col:
-            start, end = month_range_boundaries(y, m)
-            spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) == date_col and f.get("op") in ("between_dates","gte","gt","lt","lte") and False] + \
-                           [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
+            start, end = month_range_boundaries_dates(y, m)
+            spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
             spec_filters.append({"column": date_col, "op": "between_dates",
-                                 "value": [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]})
+                                 "value": [start.isoformat(), end.isoformat()]})
             diag.update({"month": m, "year": y, "date_col": date_col, "temporal": "month_between",
-                         "added": diag["added"] + [{"type":"month_between", "col":date_col, "start":str(start.date()), "end":str(end.date())}]})
+                         "added": diag["added"] + [{"type":"month_between", "col":date_col, "start":str(start), "end":str(end)}]})
 
-    # FUTURO / PASADO (si no quedó rango)
+    # FUTURO / PASADO
     ti = spec.get("temporal_intent")
     if ti is None:
         if detect_future_intent_text(question): ti="future"
         elif detect_past_intent_text(question): ti="past"
     if ti and date_col and not any(_map_col(f.get("column",""), list(df.columns))==date_col and f.get("op")=="between_dates" for f in spec_filters):
-        today_str = TODAY_TS.strftime("%Y-%m-%d")
+        today_str = TODAY_DATE.isoformat()
         spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
         if ti == "future":
-            spec_filters.append({"column": date_col, "op":"gte", "value":[today_str]})
+            spec_filters.append({"column": date_col, "op":"gte_today", "value":[today_str]})
         elif ti == "past":
-            spec_filters.append({"column": date_col, "op":"lt", "value":[today_str]})
+            spec_filters.append({"column": date_col, "op":"lt_today", "value":[today_str]})
         diag.update({"temporal": ti, "date_col": date_col,
                      "added": diag["added"] + [{"type":ti, "col":date_col, "value":today_str}]})
 
@@ -486,7 +496,7 @@ def time_enforcer_attach(question: str, spec: Dict[str,Any], df: pd.DataFrame) -
     return spec, diag
 
 # =========================
-#  Filtros exactos en pandas (A PRUEBA DE ERRORES DE TIEMPO)
+#  Filtros exactos en pandas (UNIVERSAL)
 # =========================
 def _ensure_list(x):
     if isinstance(x,list): return x
@@ -506,55 +516,62 @@ def _month_token_to_int(tok: str) -> Optional[int]:
     if t in SPANISH_MONTHS_ABBR: return SPANISH_MONTHS_ABBR[t]
     return None
 
+def _series_as_date(s: pd.Series) -> pd.Series:
+    """
+    Garantiza que la Serie sea de tipo date (datetime.date) de forma segura.
+    - Si ya viene como date (object con date), se usa tal cual.
+    - Si viene string/None, se convierte con to_datetime(...).dt.date (coerce).
+    - Nunca rompe por NaN: deja NaT/None donde no se pueda convertir.
+    """
+    if s.dtype == "object" and len(s.dropna())>0 and isinstance(s.dropna().iloc[0], dt.date):
+        return s  # ya es date
+    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.date
+
 def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.DataFrame, List[Dict[str,Any]]]:
     """
-    Parser robusto (a prueba de errores de tiempo):
-      Paso 1: Convertir TODAS las columnas de fecha presentes a datetime (coerce) y además preparar su .dt.date
-      Paso 2: today = datetime.date.today()
-      Paso 3: Comparaciones temporales usan series_date (con .notna()) y operadores contra 'date' (no timestamp)
-
-      Ejemplo futuro ESTRICTO (facturas a pagar desde hoy en adelante):
-        series_date = fechas_pago.dt.date
-        df[(series_date.notna()) & (series_date > today)]
+    Solución universal:
+    - TODAS las comparaciones temporales se hacen sobre Series de tipo date (datetime.date)
+    - Manejo robusto de NaN/NaT (si es fecha inválida, se excluye de la comparación)
+    - Operadores soportados:
+        eq, neq, in, not_in, contains, not_contains
+        gt, gte, lt, lte (numérico y fecha)
+        between_dates (rango inclusivo, fechas)
+        month_eq (1..12 o 'marzo'/'mar')
+        empty, not_empty
+        future/gte_today, past/lt_today (atajos)
     """
     if df.empty or not filters: 
         return df.copy(), []
 
     df2 = df.copy()
     cols=list(df2.columns)
-
-    # Paso 1 — preparar mapa de fechas: datetime + date
-    date_map: Dict[str, Dict[str, pd.Series]] = {}
-    for c in DATE_FIELDS:
-        if c in df2.columns:
-            sdt = pd.to_datetime(df2[c], errors="coerce", dayfirst=True)
-            date_map[c] = {
-                "dt": sdt,                       # datetime64[ns] (puede tener NaT)
-                "date": sdt.dt.date              # dtype=object con date o NaT → NaT se vuelve NaT/None
-            }
-
-    # Reemplazar en df2 para tener columnas 'date' paralelas (no pisamos las originales):
-    # Acceso: date_map[col]["dt"] y date_map[col]["date"]
-    today = dt.date.today()  # Paso 2
-
+    today = dt.date.today()
     mask = pd.Series(True, index=df2.index)
     log: List[Dict[str,Any]] = []
 
+    def _to_num_like(x):
+        try:
+            if pd.isna(x): return None
+            if isinstance(x,(int,float)): return float(x)
+            s=str(x).strip().replace(" ","").replace("$","").replace(".","").replace(",",".")
+            v=pd.to_numeric(s, errors="coerce")
+            return None if pd.isna(v) else float(v)
+        except Exception:
+            return None
+
     for f in filters:
         col=_map_col(str(f.get("column","")), cols)
-        op=str(f.get("op","")).strip()
+        op=str(f.get("op","")).strip().lower()
         vals=_ensure_list(f.get("value", []))
         if not col or col not in cols or not op:
             continue
 
-        s = df2[col]
-        m = pd.Series(True, index=df2.index)
+        s=df2[col]
+        m=pd.Series(True, index=df2.index)
 
         try:
-            # Si la columna es de fecha conocida, usamos versiones seguras
-            is_date_col = col in date_map
-            s_dt   = date_map[col]["dt"]   if is_date_col else None
-            s_date = date_map[col]["date"] if is_date_col else None
+            is_date = (col in DATE_FIELDS) or ("fecha" in _norm(col) or "ingreso" in _norm(col) or "entrega" in _norm(col) or "pago" in _norm(col) or "factur" in _norm(col))
+            s_date = _series_as_date(s) if is_date else None
 
             if op in ["eq","neq","contains","not_contains","in","not_in"]:
                 sv=s.astype(str).str.upper().str.strip()
@@ -574,46 +591,42 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
                 # NUMÉRICO
                 if pd.api.types.is_numeric_dtype(s):
                     sn=pd.to_numeric(s, errors="coerce")
-                    val=_to_number(vals[0]) if vals else None
-                    if val is None: 
-                        m=pd.Series(False,index=df2.index)
+                    val=_to_num_like(vals[0]) if vals else None
+                    if val is None: m=pd.Series(False,index=df2.index)
                     else:
-                        if op=="gt": m=sn>val
+                        if op=="gt":  m=sn>val
                         if op=="gte": m=sn>=val
-                        if op=="lt": m=sn<val
+                        if op=="lt":  m=sn<val
                         if op=="lte": m=sn<=val
 
-                # FECHA (robusto: usamos s_date y today como date)
-                elif is_date_col:
-                    # Si el valor viene en texto, lo mapeamos a date; si no hay, usamos today si corresponde
-                    val_date = None
+                # FECHA universal
+                elif is_date:
+                    # valor puede ser 'HOY'/'TODAY' o fecha
+                    val_date=None
                     if vals:
-                        v0 = _to_datetime(vals[0])
-                        val_date = v0.date() if v0 is not None and pd.notna(v0) else None
-
-                    # Comparación estricta ignorando NaN (NaN -> False para todas las comparaciones)
-                    left = pd.Series(False, index=df2.index)
-                    has_date = pd.Series([d is not None for d in s_date], index=df2.index) if isinstance(s_date, pd.Series) else s.notna()
-
-                    if op in ["gt","gte","lt","lte"]:
-                        # Si no se especifica un valor, y es un filtro temporal 'future/past', 
-                        # es válido que el enforcer haya puesto la fecha de HOY ya en vals[0].
-                        # Si siguiera faltando, por seguridad devolvemos todo False.
-                        if val_date is None:
-                            m = pd.Series(False, index=df2.index)
+                        token=str(vals[0]).strip().upper()
+                        if token in ("HOY","TODAY","NOW"): val_date=today
                         else:
-                            if op=="gt":  m = has_date & (s_date >  val_date)
-                            if op=="gte": m = has_date & (s_date >= val_date)
-                            if op=="lt":  m = has_date & (s_date <  val_date)
-                            if op=="lte": m = has_date & (s_date <= val_date)
+                            ts=_to_datetime(vals[0])
+                            val_date = ts.date() if ts is not None and pd.notna(ts) else None
+                    if val_date is None and op in ("gt","gte"):  # atajo: >= HOY si no vino valor
+                        val_date=today
+                    has_date = pd.Series([d is not None for d in s_date], index=df2.index)
+                    if val_date is None:
+                        m = pd.Series(False, index=df2.index)
+                    else:
+                        if op=="gt":  m = has_date & (s_date >  val_date)
+                        if op=="gte": m = has_date & (s_date >= val_date)
+                        if op=="lt":  m = has_date & (s_date <  val_date)
+                        if op=="lte": m = has_date & (s_date <= val_date)
 
                 # TEXTO (fallback)
                 else:
                     sv=s.astype(str)
                     v=str(vals[0]) if vals else ""
-                    if op=="gt": m=sv>v
+                    if op=="gt":  m=sv>v
                     if op=="gte": m=sv>=v
-                    if op=="lt": m=sv<v
+                    if op=="lt":  m=sv<v
                     if op=="lte": m=sv<=v
 
             elif op in ["empty","not_empty"]:
@@ -622,31 +635,42 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
                 m = empty_mask if op=="empty" else ~empty_mask
 
             elif op=="between_dates":
-                # Inclusivo en ambos extremos: s_date >= sd & s_date <= ed
-                if is_date_col:
+                if is_date:
                     sd=_to_datetime(vals[0]) if len(vals)>=1 and vals[0] else None
                     ed=_to_datetime(vals[1]) if len(vals)>=2 and vals[1] else None
                     sd_date = sd.date() if sd is not None and pd.notna(sd) else None
                     ed_date = ed.date() if ed is not None and pd.notna(ed) else None
                     has_date = pd.Series([d is not None for d in s_date], index=df2.index)
                     m = has_date
-                    if sd_date is not None:
-                        m = m & (s_date >= sd_date)
-                    if ed_date is not None:
-                        m = m & (s_date <= ed_date)
+                    if sd_date is not None: m = m & (s_date >= sd_date)
+                    if ed_date is not None: m = m & (s_date <= ed_date)
                 else:
-                    # si no es fecha, no tiene sentido; devolvemos True para no bloquear
                     m = pd.Series(True, index=df2.index)
 
             elif op=="month_eq":
-                # Aquí necesitamos .dt.month → usamos s_dt
-                if is_date_col:
+                if is_date:
                     month_token = vals[0] if vals else None
                     target = _month_token_to_int(month_token)
                     if target is None:
-                        m = pd.Series(False,index=df2.index)
+                        m = pd.Series(False, index=df2.index)
                     else:
-                        m = (date_map[col]["dt"].dt.month == int(target)).fillna(False)
+                        s_dt = pd.to_datetime(s_date, errors="coerce")
+                        m = (s_dt.dt.month == int(target)).fillna(False)
+                else:
+                    m = pd.Series(False, index=df2.index)
+
+            # ATAJOS universales
+            elif op in ["future","gte_today",">hoy"]:
+                if is_date:
+                    has_date = pd.Series([d is not None for d in s_date], index=df2.index)
+                    m = has_date & (s_date >= today)
+                else:
+                    m = pd.Series(False, index=df2.index)
+
+            elif op in ["past","lt_today","<hoy"]:
+                if is_date:
+                    has_date = pd.Series([d is not None for d in s_date], index=df2.index)
+                    m = has_date & (s_date < today)
                 else:
                     m = pd.Series(False, index=df2.index)
 
@@ -659,18 +683,10 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
         mask &= m
         log.append({"column":col,"op":op,"value":vals,"remaining":int(mask.sum())})
 
-    # Regla pedida: “futuro a partir de hoy” (ya la suele crear el enforcer como gte hoy),
-    # pero si llega una condición genérica en runtime (ej. FECHA DE PAGO FACTURA sin valor),
-    # aseguramos que se traduzca a: notna & > today
-    # >>> ejemplo manual (por si te sirve en alguna vista): 
-    # if "FECHA DE PAGO FACTURA" in date_map and any(f.get("op")=="future_hard" for f in filters):
-    #     s_date = date_map["FECHA DE PAGO FACTURA"]["date"]
-    #     mask = mask & (pd.Series([d is not None for d in s_date], index=df2.index) & (s_date > today))
-
     return df2[mask].copy(), log
 
 # =========================
-#  DURACIÓN (lo que más tiempo lleva)
+#  DURACIÓN
 # =========================
 def detect_duration_intent(question: str) -> bool:
     q=_norm(question)
@@ -684,17 +700,20 @@ def compute_duration_table(df: pd.DataFrame, top_n: int = 10) -> Tuple[str, pd.D
     if df.empty:
         return "No hay datos para calcular duración.", df
     base = df.copy()
+    # Usamos fechas ya convertidas a date:
     col = "FECHA INGRESO PLANTA" if "FECHA INGRESO PLANTA" in base.columns else ("FECHA RECEPCION" if "FECHA RECEPCION" in base.columns else None)
     if not col:
         return "No existe columna de ingreso/recepción para calcular duración.", df
-    s = ensure_datetime_series(base[col])
-    base["DIAS_EN_TALLER_CALC"] = (TODAY_TS - s).dt.days
+    s_date = _series_as_date(base[col])
+    # Pasamos s_date a datetime para restar (o calculamos a mano):
+    s_dt = pd.to_datetime(s_date, errors="coerce")
+    base["DIAS_EN_TALLER_CALC"] = (TODAY_TS - s_dt).dt.days
     out = base.sort_values("DIAS_EN_TALLER_CALC", ascending=False).head(top_n)
     cols = [c for c in ["OT","PATENTE","NOMBRE CLIENTE","ESTADO SERVICIO","FECHA INGRESO PLANTA","DIAS_EN_TALLER_CALC"] if c in out.columns]
     return f"Top {len(out)} vehículos con mayor tiempo en taller (al {TODAY_TS.date()}):", out[cols] if cols else out
 
 # =========================
-#  RAG utilidades (embeddings, índice, retrieval)
+#  RAG (embeddings, índice, retrieval)
 # =========================
 CHROMA_AVAILABLE=True
 try:
@@ -703,8 +722,8 @@ except Exception:
     CHROMA_AVAILABLE=False
 
 def _fmt_value(v) -> str:
-    if pd.isna(v): return ""
-    if isinstance(v, pd.Timestamp): return v.strftime("%Y-%m-%d")
+    if v is None or (isinstance(v,float) and pd.isna(v)): return ""
+    if isinstance(v, (dt.date, dt.datetime)): return pd.to_datetime(v).strftime("%Y-%m-%d")
     if isinstance(v, (int,float)): return f"{v:.2f}".rstrip("0").rstrip(".")
     return str(v)
 
@@ -793,9 +812,7 @@ def retrieve_top_subset(query: str, k=6) -> Tuple[List[str], List[str]]:
 def system_prompt() -> str:
     return f"""
 Eres un CONSULTOR DE GESTIÓN y ANALISTA DE DATOS para Fénix Automotriz.
-
---- INSTRUCCIONES CLAVE ---
-1) Usa SOLO el contexto filtrado. 2) Interpreta intención y responde conciso. 3) Si falta info, dilo explícito.
+1) Usa SOLO el contexto filtrado. 2) Interpreta intención y responde conciso. 3) Si falta info, dilo.
 Contexto de Negocio:
 {BUSINESS_CONTEXT}
 """.strip()
@@ -835,8 +852,8 @@ def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6):
     # Post-filtro "por pagar / no pagadas": fecha de pago NaN o >= hoy
     if detect_unpaid_intent(question) and isinstance(filtered_df, pd.DataFrame) and not filtered_df.empty:
         if "FECHA DE PAGO FACTURA" in filtered_df.columns:
-            s = pd.to_datetime(filtered_df["FECHA DE PAGO FACTURA"], errors="coerce", dayfirst=True).dt.date
-            filtered_df = filtered_df[s.isna() | (s > dt.date.today())]
+            s_date = _series_as_date(filtered_df["FECHA DE PAGO FACTURA"])
+            filtered_df = filtered_df[(pd.Series([d is None for d in s_date]) | (s_date >= dt.date.today()))]
 
     if (not isinstance(filtered_df, pd.DataFrame)) or filtered_df.empty:
         soft = [f for f in spec.get("filters", []) if f.get("op") not in ("contains","not_contains")]
@@ -880,20 +897,23 @@ with st.sidebar:
         if st.button("Cerrar sesión"):
             st.session_state.authed=False; st.rerun()
 
+# Login gate
 if not st.session_state.authed:
     login_view()
     st.markdown('<div class="nexa-footer">Desarrollado por Nexa Corp. todos los derechos reservados.</div>', unsafe_allow_html=True)
     st.stop()
 
+# Carga datos
 raw_df = get_data_from_gsheet()
 if raw_df.empty:
     st.error("La hoja MODELO_BOT está vacía o no se pudo leer."); st.stop()
 df = normalize_df(raw_df)
 
+# Top bar
 c1, c2 = st.columns([5,1])
 with c1:
     st.title("Consulta Nexa IA")
-    st.caption("Asistente de análisis para Fénix Automotriz (RAG dos pasos + filtros temporales robustos)")
+    st.caption("Asistente de análisis para Fénix Automotriz (RAG de dos pasos + fechas universales)")
 with c2:
     st.markdown('<div class="nexa-topbar">', unsafe_allow_html=True)
     safe_image("Fenix_isotipo.png", width=72)
@@ -906,6 +926,9 @@ def estimate_tokens(*texts) -> int:
     total_chars = sum(len(t) for t in texts if t)
     return max(1, total_chars // 4)
 
+# =========================
+#  Páginas
+# =========================
 def page_chat():
     with st.expander("⚙️ Parámetros de consulta", expanded=False):
         top_k = st.slider("Top-K fragmentos para contexto", 3, 15, 6, 1, key="top_k_chat")
@@ -962,9 +985,9 @@ def page_analytics():
         month = st.selectbox("Mes", month_names, index=default_idx)
         year = st.number_input("Año", value=int(TODAY_TS.year), step=1)
         m = SPANISH_MONTHS[month]
-        s = pd.to_datetime(df["FECHA DE FACTURACION"], errors="coerce", dayfirst=True)
+        s_dt = pd.to_datetime(df["FECHA DE FACTURACION"], errors="coerce")
         start, end = month_range_boundaries(int(year), int(m))
-        sub = df[(s >= start) & (s <= end)].copy()
+        sub = df[(s_dt >= pd.Timestamp(start)) & (s_dt <= pd.Timestamp(end))].copy()
         st.dataframe(sub, use_container_width=True, hide_index=True)
         g = (sub.groupby("TIPO CLIENTE", dropna=False)["MONTO PRINCIPAL NETO"]
                .sum(min_count=1).fillna(0.0).sort_values(ascending=False))
@@ -1000,30 +1023,13 @@ def page_support():
     st.markdown("- **Web:** www.nexa.cl")
     safe_image("Nexa_logo.png", width=180)
 
-with st.sidebar:
-    pass
-
-if not st.session_state.authed:
-    pass
-else:
-    with st.sidebar:
-        pass
-    with st.sidebar:
-        pass
-
 # Router
-if not st.session_state.authed:
-    pass
-else:
-    if st.session_state.get("authed") and 'nav' in locals():
-        pass
-
-# Navegación (simple)
 with st.sidebar:
     pass
 
-# Barra lateral ya define 'nav' arriba
-if st.session_state.authed:
+if not st.session_state.authed:
+    pass
+else:
     if nav == "Consulta IA":
         page_chat()
     elif nav == "Análisis de negocio":
@@ -1035,4 +1041,5 @@ if st.session_state.authed:
     elif nav == "Soporte":
         page_support()
 
+# Footer
 st.markdown('<div class="nexa-footer">Desarrollado por Nexa Corp. todos los derechos reservados.</div>', unsafe_allow_html=True)
