@@ -407,7 +407,7 @@ def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
                 "properties":{
                     "filters":{"type":"array","items":{"type":"object","properties":{
                         "column":{"type":"string"},
-                        "op":{"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","not_contains","in","not_in","empty","not_empty","between_dates","month_eq","future","gte_today","past","lt_today"]},
+                        "op":{"type":"string","enum":["eq","neq","gt","gte","lt","lte","contains","not_contains","in","not_in","between_dates","month_eq","empty","not_empty","future","gte_today","past","lt_today"]},
                         "value":{"type":"array","items":{"type":"string"}}
                     },"required":["column","op"]}},
                     "temporal_intent":{"type":["string","null"],"enum":["future","past",None]},
@@ -721,15 +721,59 @@ try:
 except Exception:
     CHROMA_AVAILABLE=False
 
+# ----------- 👇 FUNCIÓN CORREGIDA PARA FORMATEO DE VALORES (incluye fechas y NaN/NaT) -----------
 def _fmt_value(v) -> str:
-    if v is None or (isinstance(v,float) and pd.isna(v)): return ""
-    if isinstance(v, (dt.date, dt.datetime)): return pd.to_datetime(v).strftime("%Y-%m-%d")
-    if isinstance(v, (int,float)): return f"{v:.2f}".rstrip("0").rstrip(".")
+    """
+    Formatea valores para los fragmentos:
+    - Nulos (None/NaN/NaT) → ""
+    - Fechas (date/datetime/Timestamp) → YYYY-MM-DD sin usar pd.to_datetime otra vez
+    - Números → con recorte de ceros
+    - Strings 'vacíos' o 'nan' → ""
+    """
+    # 1) Nulos primero (NaN/NaT/None)
+    try:
+        if v is None or (not isinstance(v, str) and pd.isna(v)):
+            return ""
+    except Exception:
+        pass
+
+    # 2) Texto: limpiar y normalizar nulos comunes
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "" or s.lower() in {"nan", "none", "null", "nat", "-"}:
+            return ""
+        return s
+
+    # 3) Fechas: usar strftime directamente (sin pd.to_datetime) 
+    if isinstance(v, (dt.date, dt.datetime)):
+        # Si es datetime, strftime funciona igual
+        return v.strftime("%Y-%m-%d")
+
+    # 4) Numéricos
+    if isinstance(v, (int, float)):
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        return f"{float(v):.2f}".rstrip("0").rstrip(".")
+
+    # 5) Fallback
     return str(v)
 
 def _display_value_for_fragment(col: str, val) -> str:
-    if (val is None) or (isinstance(val,float) and pd.isna(val)) or (str(val).strip()==""):
-        if col=="OT": return "Sin asignar"
+    # Mantener comportamiento: OT vacío → "Sin asignar", el resto "N/A"
+    try:
+        is_null = (val is None) or (isinstance(val, str) and val.strip()=="")
+        if not is_null:
+            try:
+                if not isinstance(val, str) and pd.isna(val):
+                    is_null = True
+            except Exception:
+                pass
+        if is_null:
+            return "Sin asignar" if col == "OT" else "N/A"
+    except Exception:
         return "N/A"
     return _fmt_value(val)
 
