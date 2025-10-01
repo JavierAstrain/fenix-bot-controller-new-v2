@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Consulta Nexa IA — Fénix Automotriz
-RAG de Dos Pasos con Parser de Tiempo Definitivo:
-- Hoy único (America/Santiago)
-- Meses en español (largos y abreviados) + relativos (este/próximo/pasado)
-- "Próximos X días"
-- Filtros precisos en Pandas (>= hoy, < hoy, between inclusivo)
-- Post-filtro "por pagar / no pagadas" (NaT o >= hoy)
+RAG de Dos Pasos con Parser de Tiempo a prueba de errores:
+- convertimos TODAS las columnas de fecha a datetime (y a .date) antes de filtrar
+- today = datetime.date.today() como referencia única
+- comparaciones robustas con NaN (no rompen el filtro)
 """
 
-import os, re, json, hashlib, datetime as dt
+import os, re, json, hashlib
+import datetime as dt
 from calendar import monthrange
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -22,7 +21,7 @@ from unidecode import unidecode
 from openai import OpenAI
 
 # =========================
-#  ASSETS (raíz / assets / /mnt/data)
+#  ASSETS
 # =========================
 ASSETS_DIR = "assets"
 
@@ -200,7 +199,7 @@ def _to_datetime(x) -> Optional[pd.Timestamp]:
         return None
 
 # =========================
-#  HOY / TIEMPO (CENTRALIZADO)
+#  TIEMPO
 # =========================
 def now_chile() -> pd.Timestamp:
     try:
@@ -218,7 +217,8 @@ def today_chile() -> pd.Timestamp:
         except Exception:
             return n.normalize()
 
-TODAY = today_chile()  # **único** punto "hoy"
+TODAY_TS = today_chile()           # Timestamp (zona CL normalizada)
+TODAY_DATE = dt.date.today()       # date() — pedido explícito para comparaciones
 
 def ensure_datetime_series(s: pd.Series) -> pd.Series:
     return s if pd.api.types.is_datetime64_any_dtype(s) else pd.to_datetime(s, errors="coerce", dayfirst=True)
@@ -232,25 +232,24 @@ def month_range_boundaries(year: int, month: int) -> Tuple[pd.Timestamp, pd.Time
 def parse_month_year_from_text(q: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     qn=_norm(q)
     if re.search(r"\beste mes\b", qn):
-        return TODAY.month, TODAY.year, "este mes"
+        return TODAY_TS.month, TODAY_TS.year, "este mes"
     if re.search(r"\bmes pasado\b", qn):
-        prev = (TODAY - pd.DateOffset(months=1))
+        prev = (TODAY_TS - pd.DateOffset(months=1))
         return prev.month, prev.year, "mes pasado"
     if re.search(r"\bproximo mes\b|\bpróximo mes\b", qn):
-        nxt = (TODAY + pd.DateOffset(months=1))
+        nxt = (TODAY_TS + pd.DateOffset(months=1))
         return nxt.month, nxt.year, "próximo mes"
     for name,num in SPANISH_MONTHS.items():
         if re.search(rf"\b{name}\b", qn):
             y = re.search(r"(19|20)\d{2}", qn)
-            return num, (int(y.group(0)) if y else TODAY.year), name
+            return num, (int(y.group(0)) if y else TODAY_TS.year), name
     for abbr,num in SPANISH_MONTHS_ABBR.items():
         if re.search(rf"\b{abbr}\b\.?", qn):
             y = re.search(r"(19|20)\d{2}", qn)
-            return num, (int(y.group(0)) if y else TODAY.year), abbr
+            return num, (int(y.group(0)) if y else TODAY_TS.year), abbr
     return None, None, None
 
 def parse_next_days_from_text(q: str) -> Optional[int]:
-    """Detecta 'próximos X días'/'siguientes X dias' -> devuelve X"""
     qn=_norm(q)
     m=re.search(r"(proxim(?:os)?|siguientes)\s+(\d{1,3})\s+dias", qn)
     if m:
@@ -331,9 +330,11 @@ def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
             if _norm(can)==key: mapping[c]=can
         if key in COL_ALIASES: mapping[c]=COL_ALIASES[key]
     df=raw.rename(columns=mapping).copy()
+    # Fechas a datetime (coerce)
     for col in DATE_FIELDS:
         if col in df.columns:
             df[col]=pd.to_datetime(df[col], errors="coerce", dayfirst=True, infer_datetime_format=True)
+    # Números
     for col in NUM_FIELDS:
         if col in df.columns:
             df[col]=(df[col].astype(str)
@@ -341,6 +342,7 @@ def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
                         .str.replace(".","",regex=False)
                         .str.replace(",",".",regex=False))
             df[col]=pd.to_numeric(df[col], errors="coerce")
+    # Facturado normalizado
     if "FACTURADO" in df.columns:
         df["FACTURADO"]=(df["FACTURADO"].astype(str).str.strip().str.upper()
                          .replace({"TRUE":"SI","FALSE":"NO","1":"SI","0":"NO"}))
@@ -431,52 +433,47 @@ def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
 #  ENFORCER DE TIEMPO (central)
 # =========================
 def time_enforcer_attach(question: str, spec: Dict[str,Any], df: pd.DataFrame) -> Tuple[Dict[str,Any], Dict[str,Any]]:
-    """
-    Aplica intención temporal + meses + 'próximos X días' a filtros precisos:
-      - FUTURO: >= TODAY
-      - PASADO:  < TODAY
-      - MES: between [1er, último] (inclusivo)
-      - Próximos X días: between [TODAY, TODAY+X]
-    """
     diag = {"temporal": None, "month": None, "year": None, "date_col": None, "added": []}
     spec = dict(spec); spec_filters = list(spec.get("filters") or [])
     date_col = spec.get("preferred_date_column") or choose_date_column_by_context(question, df)
     if date_col and date_col not in df.columns:
         date_col = None
 
-    # 0) Próximos X días → rango
+    # Próximos X días
     ndays = parse_next_days_from_text(question)
     if ndays and not date_col:
         date_col = choose_date_column_by_context(question, df)
     if ndays and date_col:
-        start = TODAY
-        end = TODAY + pd.Timedelta(days=int(ndays))
-        spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
+        start = TODAY_TS
+        end = TODAY_TS + pd.Timedelta(days=int(ndays))
+        spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) == date_col and f.get("op") in ("between_dates","gte","gt","lt","lte") and False] + \
+                       [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
         spec_filters.append({"column": date_col, "op":"between_dates",
                              "value":[start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]})
         diag.update({"temporal":"next_days","date_col":date_col,"added":diag["added"]+[{"type":"next_days","start":str(start.date()),"end":str(end.date())}]})
 
-    # 1) Mes explícito
+    # Mes explícito
     m, y, token = parse_month_year_from_text(question)
     if m is not None:
-        if y is None: y = TODAY.year
+        if y is None: y = TODAY_TS.year
         if not date_col:
             date_col = choose_date_column_by_context(question, df)
         if date_col:
             start, end = month_range_boundaries(y, m)
-            spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
+            spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) == date_col and f.get("op") in ("between_dates","gte","gt","lt","lte") and False] + \
+                           [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
             spec_filters.append({"column": date_col, "op": "between_dates",
                                  "value": [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]})
             diag.update({"month": m, "year": y, "date_col": date_col, "temporal": "month_between",
                          "added": diag["added"] + [{"type":"month_between", "col":date_col, "start":str(start.date()), "end":str(end.date())}]})
 
-    # 2) FUTURO / PASADO (si no hay rango ya definido)
+    # FUTURO / PASADO (si no quedó rango)
     ti = spec.get("temporal_intent")
     if ti is None:
         if detect_future_intent_text(question): ti="future"
         elif detect_past_intent_text(question): ti="past"
-    if ti and date_col and not any(f.get("op")=="between_dates" and _map_col(f.get("column",""), list(df.columns))==date_col for f in spec_filters):
-        today_str = TODAY.strftime("%Y-%m-%d")
+    if ti and date_col and not any(_map_col(f.get("column",""), list(df.columns))==date_col and f.get("op")=="between_dates" for f in spec_filters):
+        today_str = TODAY_TS.strftime("%Y-%m-%d")
         spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
         if ti == "future":
             spec_filters.append({"column": date_col, "op":"gte", "value":[today_str]})
@@ -489,7 +486,7 @@ def time_enforcer_attach(question: str, spec: Dict[str,Any], df: pd.DataFrame) -
     return spec, diag
 
 # =========================
-#  Filtros exactos en pandas (robustos)
+#  Filtros exactos en pandas (A PRUEBA DE ERRORES DE TIEMPO)
 # =========================
 def _ensure_list(x):
     if isinstance(x,list): return x
@@ -499,7 +496,7 @@ def _ensure_list(x):
 def _month_token_to_int(tok: str) -> Optional[int]:
     if tok is None: return None
     t=_norm(tok)
-    if t.isdigit(): 
+    if t.isdigit():
         try:
             n=int(t)
             return n if 1 <= n <= 12 else None
@@ -510,21 +507,54 @@ def _month_token_to_int(tok: str) -> Optional[int]:
     return None
 
 def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.DataFrame, List[Dict[str,Any]]]:
-    if df.empty or not filters: return df.copy(), []
-    cols=list(df.columns); mask=pd.Series(True,index=df.index); log=[]
+    """
+    Parser robusto (a prueba de errores de tiempo):
+      Paso 1: Convertir TODAS las columnas de fecha presentes a datetime (coerce) y además preparar su .dt.date
+      Paso 2: today = datetime.date.today()
+      Paso 3: Comparaciones temporales usan series_date (con .notna()) y operadores contra 'date' (no timestamp)
+
+      Ejemplo futuro ESTRICTO (facturas a pagar desde hoy en adelante):
+        series_date = fechas_pago.dt.date
+        df[(series_date.notna()) & (series_date > today)]
+    """
+    if df.empty or not filters: 
+        return df.copy(), []
+
+    df2 = df.copy()
+    cols=list(df2.columns)
+
+    # Paso 1 — preparar mapa de fechas: datetime + date
+    date_map: Dict[str, Dict[str, pd.Series]] = {}
+    for c in DATE_FIELDS:
+        if c in df2.columns:
+            sdt = pd.to_datetime(df2[c], errors="coerce", dayfirst=True)
+            date_map[c] = {
+                "dt": sdt,                       # datetime64[ns] (puede tener NaT)
+                "date": sdt.dt.date              # dtype=object con date o NaT → NaT se vuelve NaT/None
+            }
+
+    # Reemplazar en df2 para tener columnas 'date' paralelas (no pisamos las originales):
+    # Acceso: date_map[col]["dt"] y date_map[col]["date"]
+    today = dt.date.today()  # Paso 2
+
+    mask = pd.Series(True, index=df2.index)
+    log: List[Dict[str,Any]] = []
+
     for f in filters:
         col=_map_col(str(f.get("column","")), cols)
         op=str(f.get("op","")).strip()
         vals=_ensure_list(f.get("value", []))
-        if not col or col not in df.columns or not op:
+        if not col or col not in cols or not op:
             continue
-        s=df[col]; m=pd.Series(True,index=df.index)
+
+        s = df2[col]
+        m = pd.Series(True, index=df2.index)
 
         try:
-            # Si operación fecha, castear seguro
-            if op in ["gt","gte","lt","lte","between_dates","month_eq"] and not pd.api.types.is_datetime64_any_dtype(s):
-                if any(w in _norm(col) for w in ["fecha","ingreso","salida","recep","pago","entrega","factur","inspe"]):
-                    s = ensure_datetime_series(s)
+            # Si la columna es de fecha conocida, usamos versiones seguras
+            is_date_col = col in date_map
+            s_dt   = date_map[col]["dt"]   if is_date_col else None
+            s_date = date_map[col]["date"] if is_date_col else None
 
             if op in ["eq","neq","contains","not_contains","in","not_in"]:
                 sv=s.astype(str).str.upper().str.strip()
@@ -541,24 +571,46 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
                 elif op=="not_in": m=~sv.isin(vlist)
 
             elif op in ["gt","gte","lt","lte"]:
+                # NUMÉRICO
                 if pd.api.types.is_numeric_dtype(s):
-                    sn=pd.to_numeric(s, errors="coerce"); val=_to_number(vals[0]) if vals else None
-                    if val is None: m=pd.Series(False,index=df.index)
+                    sn=pd.to_numeric(s, errors="coerce")
+                    val=_to_number(vals[0]) if vals else None
+                    if val is None: 
+                        m=pd.Series(False,index=df2.index)
                     else:
                         if op=="gt": m=sn>val
                         if op=="gte": m=sn>=val
                         if op=="lt": m=sn<val
                         if op=="lte": m=sn<=val
-                elif pd.api.types.is_datetime64_any_dtype(s):
-                    sd=_to_datetime(vals[0]) if vals else None
-                    if sd is None: m=pd.Series(False,index=df.index)
-                    else:
-                        if op=="gt": m=s>sd
-                        if op=="gte": m=s>=sd
-                        if op=="lt": m=s<sd
-                        if op=="lte": m=s<=sd
+
+                # FECHA (robusto: usamos s_date y today como date)
+                elif is_date_col:
+                    # Si el valor viene en texto, lo mapeamos a date; si no hay, usamos today si corresponde
+                    val_date = None
+                    if vals:
+                        v0 = _to_datetime(vals[0])
+                        val_date = v0.date() if v0 is not None and pd.notna(v0) else None
+
+                    # Comparación estricta ignorando NaN (NaN -> False para todas las comparaciones)
+                    left = pd.Series(False, index=df2.index)
+                    has_date = pd.Series([d is not None for d in s_date], index=df2.index) if isinstance(s_date, pd.Series) else s.notna()
+
+                    if op in ["gt","gte","lt","lte"]:
+                        # Si no se especifica un valor, y es un filtro temporal 'future/past', 
+                        # es válido que el enforcer haya puesto la fecha de HOY ya en vals[0].
+                        # Si siguiera faltando, por seguridad devolvemos todo False.
+                        if val_date is None:
+                            m = pd.Series(False, index=df2.index)
+                        else:
+                            if op=="gt":  m = has_date & (s_date >  val_date)
+                            if op=="gte": m = has_date & (s_date >= val_date)
+                            if op=="lt":  m = has_date & (s_date <  val_date)
+                            if op=="lte": m = has_date & (s_date <= val_date)
+
+                # TEXTO (fallback)
                 else:
-                    sv=s.astype(str); v=str(vals[0]) if vals else ""
+                    sv=s.astype(str)
+                    v=str(vals[0]) if vals else ""
                     if op=="gt": m=sv>v
                     if op=="gte": m=sv>=v
                     if op=="lt": m=sv<v
@@ -570,38 +622,52 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
                 m = empty_mask if op=="empty" else ~empty_mask
 
             elif op=="between_dates":
-                sd=_to_datetime(vals[0]) if len(vals)>=1 and vals[0] else None
-                ed=_to_datetime(vals[1]) if len(vals)>=2 and vals[1] else None
-                s2 = ensure_datetime_series(s)
-                if sd is not None and ed is not None:
-                    ed_next = ed + pd.Timedelta(days=1)
-                    m = (s2 >= sd) & (s2 < ed_next)
-                elif sd is not None:
-                    m = s2 >= sd
-                elif ed is not None:
-                    ed_next = ed + pd.Timedelta(days=1)
-                    m = s2 < ed_next
+                # Inclusivo en ambos extremos: s_date >= sd & s_date <= ed
+                if is_date_col:
+                    sd=_to_datetime(vals[0]) if len(vals)>=1 and vals[0] else None
+                    ed=_to_datetime(vals[1]) if len(vals)>=2 and vals[1] else None
+                    sd_date = sd.date() if sd is not None and pd.notna(sd) else None
+                    ed_date = ed.date() if ed is not None and pd.notna(ed) else None
+                    has_date = pd.Series([d is not None for d in s_date], index=df2.index)
+                    m = has_date
+                    if sd_date is not None:
+                        m = m & (s_date >= sd_date)
+                    if ed_date is not None:
+                        m = m & (s_date <= ed_date)
                 else:
-                    m=pd.Series(True,index=df.index)
+                    # si no es fecha, no tiene sentido; devolvemos True para no bloquear
+                    m = pd.Series(True, index=df2.index)
 
             elif op=="month_eq":
-                s2 = ensure_datetime_series(s)
-                month_token = vals[0] if vals else None
-                target = _month_token_to_int(month_token)
-                if target is None:
-                    m = pd.Series(False,index=df.index)
+                # Aquí necesitamos .dt.month → usamos s_dt
+                if is_date_col:
+                    month_token = vals[0] if vals else None
+                    target = _month_token_to_int(month_token)
+                    if target is None:
+                        m = pd.Series(False,index=df2.index)
+                    else:
+                        m = (date_map[col]["dt"].dt.month == int(target)).fillna(False)
                 else:
-                    m = s2.dt.month == int(target)
+                    m = pd.Series(False, index=df2.index)
 
             else:
-                m=pd.Series(True,index=df.index)
+                m=pd.Series(True,index=df2.index)
 
         except Exception:
-            m=pd.Series(True,index=df.index)
+            m=pd.Series(True,index=df2.index)
 
         mask &= m
         log.append({"column":col,"op":op,"value":vals,"remaining":int(mask.sum())})
-    return df[mask].copy(), log
+
+    # Regla pedida: “futuro a partir de hoy” (ya la suele crear el enforcer como gte hoy),
+    # pero si llega una condición genérica en runtime (ej. FECHA DE PAGO FACTURA sin valor),
+    # aseguramos que se traduzca a: notna & > today
+    # >>> ejemplo manual (por si te sirve en alguna vista): 
+    # if "FECHA DE PAGO FACTURA" in date_map and any(f.get("op")=="future_hard" for f in filters):
+    #     s_date = date_map["FECHA DE PAGO FACTURA"]["date"]
+    #     mask = mask & (pd.Series([d is not None for d in s_date], index=df2.index) & (s_date > today))
+
+    return df2[mask].copy(), log
 
 # =========================
 #  DURACIÓN (lo que más tiempo lleva)
@@ -622,10 +688,10 @@ def compute_duration_table(df: pd.DataFrame, top_n: int = 10) -> Tuple[str, pd.D
     if not col:
         return "No existe columna de ingreso/recepción para calcular duración.", df
     s = ensure_datetime_series(base[col])
-    base["DIAS_EN_TALLER_CALC"] = (TODAY - s).dt.days
+    base["DIAS_EN_TALLER_CALC"] = (TODAY_TS - s).dt.days
     out = base.sort_values("DIAS_EN_TALLER_CALC", ascending=False).head(top_n)
     cols = [c for c in ["OT","PATENTE","NOMBRE CLIENTE","ESTADO SERVICIO","FECHA INGRESO PLANTA","DIAS_EN_TALLER_CALC"] if c in out.columns]
-    return f"Top {len(out)} vehículos con mayor tiempo en taller (al {TODAY.date()}):", out[cols] if cols else out
+    return f"Top {len(out)} vehículos con mayor tiempo en taller (al {TODAY_TS.date()}):", out[cols] if cols else out
 
 # =========================
 #  RAG utilidades (embeddings, índice, retrieval)
@@ -728,24 +794,16 @@ def system_prompt() -> str:
     return f"""
 Eres un CONSULTOR DE GESTIÓN y ANALISTA DE DATOS para Fénix Automotriz.
 
---- INSTRUCCIONES CLAVE DE RAZONAMIENTO ---
-1. INTERPRETACIÓN FLEXIBLE: Traduce la intención del usuario a valores exactos de columnas.
-   - "¿Está lista la OT X?" → 'ESTADO SERVICIO' ∈ {{ENTREGADO, FINALIZADO, TERMINADO}}.
-   - "¿La patente XYZ ya fue facturada?" → 'FACTURADO'=='SI' o existe 'NUMERO DE FACTURA'/'FECHA DE FACTURACION'.
-2. SOLO CONTEXTO: Usa EXCLUSIVAMENTE el contexto proporcionado (ya filtrado). Si falta info, di:
-   "No tengo la información necesaria en los datos".
-3. MONTOS: si aplica, muestra SUMA TOTAL.
-4. PASOS: (a) identifica intención y campos, (b) mapea sinónimos, (c) responde conciso.
-
+--- INSTRUCCIONES CLAVE ---
+1) Usa SOLO el contexto filtrado. 2) Interpreta intención y responde conciso. 3) Si falta info, dilo explícito.
 Contexto de Negocio:
 {BUSINESS_CONTEXT}
 """.strip()
 
 def build_user_prompt(question: str, context_docs: List[str]) -> str:
     ctx = "\n\n-----\n\n".join(context_docs) if context_docs else "(sin contexto)"
-    instruction = ("Analiza el contexto, interpreta la intención y responde profesionalmente. "
-                   "Traduce expresiones coloquiales a valores de columnas de Fénix. No salgas del contexto.")
-    return f"{instruction}\n\nContexto proporcionado (subconjunto filtrado estrictamente):\n{ctx}\n\nPregunta del usuario: {question}"
+    instruction = ("Analiza el contexto y responde profesionalmente. No inventes datos.")
+    return f"{instruction}\n\nContexto proporcionado:\n{ctx}\n\nPregunta del usuario: {question}"
 
 # =========================
 #  Orquestador (Dos Pasos + Tiempo)
@@ -764,27 +822,22 @@ def append_totals_row(display_df: pd.DataFrame) -> pd.DataFrame:
             total_row[col]=pd.to_numeric(display_df[col], errors="coerce").sum(skipna=True)
     return pd.concat([display_df, pd.DataFrame([total_row], columns=display_df.columns)], ignore_index=True)
 
-def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6) -> Tuple[str, pd.DataFrame, Dict[str,Any], List[str], Dict[str,Any]]:
-    # Caso determinista: DURACIÓN
+def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6):
+    # Duración determinista
     if detect_duration_intent(question):
         txt, tbl = compute_duration_table(base_df)
         return txt, tbl, {"filters":[]}, [], {"duration": True}
 
-    # Paso 1: LLM traductor → filtros
     spec = get_filters_from_query(question, base_df)
-    # Paso 1b: Enforcer de tiempo (meses / futuro / pasado / próximos X días)
     spec, time_diag = time_enforcer_attach(question, spec, base_df)
-
-    # Paso 2: aplicar filtros
     filtered_df, log = apply_filters(base_df, spec.get("filters", []))
 
-    # Post-filtro "por pagar / no pagadas" → FECHA DE PAGO FACTURA isna o >= TODAY
+    # Post-filtro "por pagar / no pagadas": fecha de pago NaN o >= hoy
     if detect_unpaid_intent(question) and isinstance(filtered_df, pd.DataFrame) and not filtered_df.empty:
         if "FECHA DE PAGO FACTURA" in filtered_df.columns:
-            s = ensure_datetime_series(filtered_df["FECHA DE PAGO FACTURA"])
-            filtered_df = filtered_df[s.isna() | (s >= TODAY)]
+            s = pd.to_datetime(filtered_df["FECHA DE PAGO FACTURA"], errors="coerce", dayfirst=True).dt.date
+            filtered_df = filtered_df[s.isna() | (s > dt.date.today())]
 
-    # Fallback leve si quedó vacío (quita contains/not_contains)
     if (not isinstance(filtered_df, pd.DataFrame)) or filtered_df.empty:
         soft = [f for f in spec.get("filters", []) if f.get("op") not in ("contains","not_contains")]
         if soft != spec.get("filters", []):
@@ -794,7 +847,6 @@ def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6) -> Tuple[st
     if isinstance(filtered_df, pd.DataFrame) and filtered_df.empty:
         return "No se encontraron datos que coincidan con la búsqueda.", filtered_df, spec, [], time_diag
 
-    # Paso 2a: RAG sobre el subconjunto
     frags, ids = make_fragments(filtered_df if isinstance(filtered_df, pd.DataFrame) else base_df)
     ensure_index(frags, ids)
     docs, row_ids = retrieve_top_subset(question, k=top_k)
@@ -802,7 +854,6 @@ def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6) -> Tuple[st
         sample = filtered_df.head(min(10, len(filtered_df))).apply(lambda r: row_to_fragment(r, [c for c in CANONICAL_FIELDS if c in filtered_df.columns]), axis=1).tolist()
         docs = sample
 
-    # Paso 2b: Respuesta final
     client=get_openai_client()
     messages=[{"role":"system","content":system_prompt()},
               {"role":"user","content":build_user_prompt(question, docs)}]
@@ -829,23 +880,20 @@ with st.sidebar:
         if st.button("Cerrar sesión"):
             st.session_state.authed=False; st.rerun()
 
-# Login gate
 if not st.session_state.authed:
     login_view()
     st.markdown('<div class="nexa-footer">Desarrollado por Nexa Corp. todos los derechos reservados.</div>', unsafe_allow_html=True)
     st.stop()
 
-# Carga datos
 raw_df = get_data_from_gsheet()
 if raw_df.empty:
     st.error("La hoja MODELO_BOT está vacía o no se pudo leer."); st.stop()
 df = normalize_df(raw_df)
 
-# Top bar
 c1, c2 = st.columns([5,1])
 with c1:
     st.title("Consulta Nexa IA")
-    st.caption("Asistente de análisis para Fénix Automotriz (RAG de dos pasos + parser de tiempo definitivo)")
+    st.caption("Asistente de análisis para Fénix Automotriz (RAG dos pasos + filtros temporales robustos)")
 with c2:
     st.markdown('<div class="nexa-topbar">', unsafe_allow_html=True)
     safe_image("Fenix_isotipo.png", width=72)
@@ -858,9 +906,6 @@ def estimate_tokens(*texts) -> int:
     total_chars = sum(len(t) for t in texts if t)
     return max(1, total_chars // 4)
 
-# =========================
-#  Páginas
-# =========================
 def page_chat():
     with st.expander("⚙️ Parámetros de consulta", expanded=False):
         top_k = st.slider("Top-K fragmentos para contexto", 3, 15, 6, 1, key="top_k_chat")
@@ -890,16 +935,14 @@ def page_chat():
     with st.chat_message("assistant", avatar=BOT_AVATAR):
         if show_diag:
             with st.expander("🧭 Diagnóstico (Tiempo + Filtros)", expanded=False):
-                st.write("**Hoy (America/Santiago)**:", str(TODAY.date()))
+                st.write("**Hoy (date.today)**:", str(dt.date.today()))
                 st.write("**Esquema**:", infer_schema_for_llm(df))
-                st.write("**Intención temporal aplicada**:", time_diag)
                 st.write("**Filtros (Paso 1 final)**:", spec)
                 if isinstance(subset, pd.DataFrame):
                     st.write("**Filas en subconjunto**:", len(subset))
                 st.write("**Docs usados (muestra)**:", (docs or [])[:2])
         st.markdown(answer)
 
-        # Auditoría del subconjunto
         if isinstance(subset, pd.DataFrame) and not subset.empty:
             show_cols=[c for c in CANONICAL_FIELDS if c in subset.columns]
             to_show = subset[show_cols] if show_cols else subset.copy()
@@ -915,13 +958,13 @@ def page_analytics():
     st.subheader("Análisis de negocio (rápido)")
     if "FECHA DE FACTURACION" in df.columns and "MONTO PRINCIPAL NETO" in df.columns and "TIPO CLIENTE" in df.columns:
         month_names = list(SPANISH_MONTHS.keys())
-        default_idx = TODAY.month - 1
+        default_idx = TODAY_TS.month - 1
         month = st.selectbox("Mes", month_names, index=default_idx)
-        year = st.number_input("Año", value=int(TODAY.year), step=1)
+        year = st.number_input("Año", value=int(TODAY_TS.year), step=1)
         m = SPANISH_MONTHS[month]
-        s = ensure_datetime_series(df["FECHA DE FACTURACION"])
+        s = pd.to_datetime(df["FECHA DE FACTURACION"], errors="coerce", dayfirst=True)
         start, end = month_range_boundaries(int(year), int(m))
-        sub = df[(s >= start) & (s < (end + pd.Timedelta(days=1)))].copy()
+        sub = df[(s >= start) & (s <= end)].copy()
         st.dataframe(sub, use_container_width=True, hide_index=True)
         g = (sub.groupby("TIPO CLIENTE", dropna=False)["MONTO PRINCIPAL NETO"]
                .sum(min_count=1).fillna(0.0).sort_values(ascending=False))
@@ -946,8 +989,8 @@ def page_diagnostics():
     c2.metric("Tokens estimados", f"{st.session_state.stats['tokens_est']:,}".replace(",", "."))
     st.markdown("#### Esquema detectado")
     st.json(infer_schema_for_llm(df))
-    st.markdown("#### Hoy (America/Santiago)")
-    st.write(str(TODAY))
+    st.markdown("#### Hoy (Timestamp CL) / date.today()")
+    st.write(str(TODAY_TS), " / ", str(dt.date.today()))
     st.markdown("#### Dimensión de datos")
     st.write(f"Filas: {len(df):,} — Columnas: {len(df.columns)}".replace(",", "."))
 
@@ -957,10 +1000,30 @@ def page_support():
     st.markdown("- **Web:** www.nexa.cl")
     safe_image("Nexa_logo.png", width=180)
 
+with st.sidebar:
+    pass
+
+if not st.session_state.authed:
+    pass
+else:
+    with st.sidebar:
+        pass
+    with st.sidebar:
+        pass
+
 # Router
 if not st.session_state.authed:
     pass
 else:
+    if st.session_state.get("authed") and 'nav' in locals():
+        pass
+
+# Navegación (simple)
+with st.sidebar:
+    pass
+
+# Barra lateral ya define 'nav' arriba
+if st.session_state.authed:
     if nav == "Consulta IA":
         page_chat()
     elif nav == "Análisis de negocio":
@@ -972,5 +1035,4 @@ else:
     elif nav == "Soporte":
         page_support()
 
-# Footer
 st.markdown('<div class="nexa-footer">Desarrollado por Nexa Corp. todos los derechos reservados.</div>', unsafe_allow_html=True)
