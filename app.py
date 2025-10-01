@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 Consulta Nexa IA — Fénix Automotriz
-Implementa Analizador de Consulta de Dos Pasos:
-  Paso 1: get_filters_from_query (LLM traductor → filtros exactos JSON)
-  Paso 2: RAG sobre el subconjunto filtrado + respuesta final del LLM
-Incluye: normalización de datos, fechas estrictas, meses en español,
-agregaciones deterministas cuando aplica, UI con login y marca.
+Arquitectura RAG de Dos Pasos con manejo de TIEMPO centralizado:
+  Paso 1 (LLM Traductor)  -> Filtros estrictos (JSON)
+  Paso 2 (Pandas + RAG)   -> Subconjunto filtrado + respuesta final
+
+Mejoras clave de tiempo:
+- Punto de referencia "HOY" centralizado (America/Santiago)
+- Parser robusto de mes/año (enero..dic / ene..dic + relativo: este mes, mes pasado, próximo mes)
+- Enforce FUTURO/PASADO según intención
+- Rango mensual preciso (primer día -> último día, inclusivo)
+- Casteo a datetime garantizado antes de comparar
+- Duración (lo que más tiempo lleva) calculada en pandas
 """
 
 import os, re, json, hashlib, datetime as dt
+from calendar import monthrange
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
@@ -47,7 +54,7 @@ def safe_image(name_or_path: str, **kwargs) -> bool:
 # =========================
 st.set_page_config(
     page_title="Consulta Nexa IA",
-    page_icon=safe_page_icon("Isotipo_Nexa.png"),  # <- favicon de Nexa (en raíz o assets/)
+    page_icon=safe_page_icon("Isotipo_Nexa.png"),  # favicon Nexa
     layout="wide",
 )
 
@@ -165,6 +172,9 @@ SPANISH_MONTHS = {
 }
 SPANISH_MONTHS_ABBR = {"ene":1,"feb":2,"mar":3,"abr":4,"may":5,"jun":6,"jul":7,"ago":8,"sep":9,"set":9,"oct":10,"nov":11,"dic":12}
 
+# =========================
+#  NORMALIZADORES / UTILS
+# =========================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", unidecode(str(s)).strip().lower())
 
@@ -175,12 +185,9 @@ def _map_col(col: str, available: List[str]) -> Optional[str]:
     if not col: return None
     if col in available: return col
     key=_norm(col)
-    # match exact normalized
     for a in available:
         if _norm(a)==key: return a
-    # aliases
     if key in COL_ALIASES and COL_ALIASES[key] in available: return COL_ALIASES[key]
-    # partial
     for a in available:
         if key in _norm(a): return a
     return None
@@ -200,8 +207,88 @@ def _to_datetime(x) -> Optional[pd.Timestamp]:
     except Exception:
         return None
 
+# =========================
+#  HOY / TIEMPO (CENTRALIZADO)
+# =========================
+def now_chile() -> pd.Timestamp:
+    try:
+        return pd.Timestamp.now(tz="America/Santiago")
+    except Exception:
+        return pd.Timestamp.now()
+
+def today_chile() -> pd.Timestamp:
+    n = now_chile()
+    # normalizamos a día sin tz para comparaciones
+    try:
+        return n.normalize().tz_convert(None)  # si viene tz-aware
+    except Exception:
+        try:
+            return n.normalize().tz_localize(None)
+        except Exception:
+            return n.normalize()
+
+TODAY = today_chile()  # **Único punto** de referencia de "hoy"
+
+def ensure_datetime_series(s: pd.Series) -> pd.Series:
+    return s if pd.api.types.is_datetime64_any_dtype(s) else pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+def month_range_boundaries(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    start = pd.Timestamp(year=int(year), month=int(month), day=1)
+    end_day = monthrange(int(year), int(month))[1]
+    end = pd.Timestamp(year=int(year), month=int(month), day=end_day)
+    return start, end
+
+def parse_month_year_from_text(q: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    qn=_norm(q)
+    # palabras relativas
+    if re.search(r"\beste mes\b", qn):
+        return TODAY.month, TODAY.year, "este mes"
+    if re.search(r"\bmes pasado\b", qn):
+        prev = (TODAY - pd.DateOffset(months=1))
+        return prev.month, prev.year, "mes pasado"
+    if re.search(r"\bproximo mes\b|\bpróximo mes\b", qn):
+        nxt = (TODAY + pd.DateOffset(months=1))
+        return nxt.month, nxt.year, "próximo mes"
+
+    # nombres largos
+    for name,num in SPANISH_MONTHS.items():
+        if re.search(rf"\b{name}\b", qn):
+            y = re.search(r"(19|20)\d{2}", qn)
+            return num, (int(y.group(0)) if y else TODAY.year), name
+    # abreviaturas
+    for abbr,num in SPANISH_MONTHS_ABBR.items():
+        if re.search(rf"\b{abbr}\b\.?", qn):
+            y = re.search(r"(19|20)\d{2}", qn)
+            return num, (int(y.group(0)) if y else TODAY.year), abbr
+    return None, None, None
+
+def detect_future_intent_text(q: str) -> bool:
+    qn=_norm(q)
+    keys=["proxim","próxim","pronto","futuro","en adelante","desde hoy","a partir de hoy",
+          "hoy en adelante","pendiente de pago","pendientes de pago","por pagar","a pagar",
+          "vencen","vencimiento","por vencer"]
+    return any(k in qn for k in keys)
+
+def detect_past_intent_text(q: str) -> bool:
+    qn=_norm(q)
+    return any(k in qn for k in ["pasado","anteriores","historial","histórico"])
+
+def choose_date_column_by_context(question: str, df: pd.DataFrame) -> Optional[str]:
+    q=_norm(question); pref=[]
+    if "pago" in q or "pagar" in q: pref+=["FECHA DE PAGO FACTURA"]
+    if "factur" in q or "factura" in q: pref+=["FECHA DE FACTURACION"]
+    if "entreg" in q: pref+=["FECHA ENTREGA"]
+    if "ingres" in q: pref+=["FECHA INGRESO PLANTA"]
+    if "recepc" in q: pref+=["FECHA RECEPCION"]
+    pref += ["FECHA DE PAGO FACTURA","FECHA DE FACTURACION","FECHA ENTREGA","FECHA INGRESO PLANTA","FECHA RECEPCION"]
+    for c in pref:
+        if c in df.columns: return c
+    return None
+
+# =========================
+#  CARGA GOOGLE SHEETS
+# =========================
 def _load_sa() -> Dict[str,Any]:
-    # Busca credenciales en secrets/env
     for k in ["gcp_service_account","service_account","google_service_account"]:
         try:
             obj = st.secrets[k]
@@ -235,7 +322,6 @@ def get_data_from_gsheet() -> pd.DataFrame:
 
 def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
     if raw.empty: return raw.copy()
-    # renombrado canónico
     mapping={}
     for c in raw.columns:
         key=_norm(c)
@@ -271,7 +357,7 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 # =========================
-#  Paso 1: Analizador de filtros (LLM → JSON)
+#  Paso 1: LLM → filtros estrictos
 # =========================
 def infer_schema_for_llm(df: pd.DataFrame) -> Dict[str,Any]:
     schema={}
@@ -284,52 +370,39 @@ def infer_schema_for_llm(df: pd.DataFrame) -> Dict[str,Any]:
 
 def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
     """
-    Usa un LLM como TRADUCTOR DE NEGOCIOS para producir filtros tabulares exactos.
-    Devuelve dict:
-      {"filters":[{"column":..,"op":..,"value":[...]}],
-       "temporal_intent": "future"|"past"|null,
-       "preferred_date_column": "FECHA ..."|null }
-    Reglas incluidas: 'lista'→estado entregado/finalizado, 'sin aprobar'→presupuesto != Aprobado,
-                      'sin factura'→ FACTURADO!='SI' o Num/Fecha vacíos, meses en español, etc.
+    LLM Traductor de Negocios -> produce filtros exactos (JSON).
+    Incluye intención temporal y columna de fecha preferida.
     """
     client=get_openai_client()
     schema = json.dumps(infer_schema_for_llm(df), ensure_ascii=False)
 
     system = (
-        "Eres un TRADUCTOR DE NEGOCIOS. Tu ÚNICA tarea es convertir una pregunta en español "
-        "en filtros tabulares para un DataFrame de la empresa Fénix Automotriz. "
-        "Debes usar SOLO los nombres de columna existentes. "
-        "Devuelve EXCLUSIVAMENTE un JSON para la función."
+        "Eres un TRADUCTOR DE NEGOCIOS. Convierte una pregunta en español "
+        "en filtros tabulares EXACTOS para el DataFrame de Fénix Automotriz. "
+        "Usa SOLO nombres de columnas existentes. Devuelve SOLO JSON."
     )
-    # Reglas de traducción pedidas
     rules = """
-- Sinónimo de ESTADO SERVICIO:
-  * 'lista', 'listo', 'terminado', 'finalizado', 'entregado' → ESTADO SERVICIO IN ['ENTREGADO','FINALIZADO','TERMINADO'].
-- Sinónimo de DINERO:
-  * 'cuánto cuesta', 'monto', 'facturación' → usar campos de montos (p.ej. MONTO PRINCIPAL NETO).
-- Sinónimo de PENDIENTE:
-  * 'sin aprobar', 'no aprobado' → ESTADO PRESUPUESTO != 'APROBADO'.
-- SIN FACTURA:
-  * 'sin factura', 'no facturado' → FACTURADO != 'SI' OR NUMERO DE FACTURA empty OR FECHA DE FACTURACION empty.
-- DUPLICADOS:
-  * 'patentes duplicadas/repetidas' → agregación tipo duplicates sobre columna PATENTE.
-- Meses en español:
-  * 'marzo', 'sep', 'set', etc. Si se pide 'facturación de marzo', aplicar filtro por mes sobre FECHA DE FACTURACION.
+- Estado 'lista/terminado/entregado/finalizado' → ESTADO SERVICIO IN ['ENTREGADO','FINALIZADO','TERMINADO'].
+- Dinero 'cuánto cuesta/monto/facturación' → usar MONTO PRINCIPAL NETO / BRUTO / IVA.
+- Pendiente 'sin aprobar' → ESTADO PRESUPUESTO != 'APROBADO'.
+- 'sin factura/no facturado' → FACTURADO != 'SI' OR NUMERO DE FACTURA empty OR FECHA DE FACTURACION empty.
+- Duplicados 'patentes repetidas/duplicadas' → agregación tipo duplicates(PATENTE) (lo manejará la app).
+- Meses en español (enero..dic / ene..dic). Si piden 'de marzo', preferir FECHA DE FACTURACION.
 - Temporalidad:
-  * 'próximos días', 'en adelante', 'por pagar', 'pendiente de pago', 'vencen' → temporal_intent = 'future'.
-  * 'anteriores', 'pasados' → temporal_intent = 'past'.
-- Fecha por contexto:
-  * Si mencionan 'pago' → columna por defecto 'FECHA DE PAGO FACTURA'.
-  * Si mencionan 'entrega' → 'FECHA ENTREGA'.
-  * Si mencionan 'factura/facturación' → 'FECHA DE FACTURACION'.
+  * 'próximos días', 'en adelante', 'por pagar', 'pendientes de pago', 'vencen' → temporal_intent='future'
+  * 'anteriores', 'pasado', 'histórico' → temporal_intent='past'
+- Columna de fecha preferida:
+  * si mencionan 'pago' → FECHA DE PAGO FACTURA
+  * si 'factura/facturación' → FECHA DE FACTURACION
+  * si 'entrega' → FECHA ENTREGA
     """
-    user = f"Esquema de columnas (nombre→tipo):\n{schema}\n\nReglas:\n{rules}\n\nPregunta del usuario:\n{question}\n\nDevuelve SOLO la llamada a función."
+    user = f"Esquema (columna→tipo):\n{schema}\n\nReglas:\n{rules}\n\nPregunta:\n{question}\n\nDevuelve SOLO la llamada a función."
 
     tools=[{
         "type":"function",
         "function":{
             "name":"emitir_filtros",
-            "description":"Devuelve filtros exactos para un DataFrame de Fénix Automotriz.",
+            "description":"Devuelve filtros exactos (JSON).",
             "parameters":{
                 "type":"object",
                 "properties":{
@@ -366,6 +439,61 @@ def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
     return out
 
 # =========================
+#  LÓGICA CENTRAL DE TIEMPO (APLICADA A LOS FILTROS)
+# =========================
+def time_enforcer_attach(question: str, spec: Dict[str,Any], df: pd.DataFrame) -> Tuple[Dict[str,Any], Dict[str,Any]]:
+    """
+    Traducimos la intención temporal + meses explícitos a filtros pandas precisos.
+    - FUTURO: >= TODAY
+    - PASADO:  < TODAY
+    - MES explícito / este mes / pasado / próximo: BETWEEN [1er día, último día]
+    Retorna spec modificado + diagnóstico (qué se aplicó).
+    """
+    diag = {"temporal": None, "month": None, "year": None, "date_col": None, "added": []}
+    spec = dict(spec)
+    spec_filters = list(spec.get("filters") or [])
+    date_col = spec.get("preferred_date_column") or choose_date_column_by_context(question, df)
+    if date_col and date_col not in df.columns:
+        date_col = None
+
+    # 1) Mes/Año desde el texto (robusto)
+    m, y, token = parse_month_year_from_text(question)
+    if m is not None:
+        if y is None: y = TODAY.year
+        if not date_col:
+            date_col = choose_date_column_by_context(question, df)
+        if date_col:
+            start, end = month_range_boundaries(y, m)
+            # Aplicamos between_dates inclusivo
+            spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
+            spec_filters.append({"column": date_col, "op": "between_dates", "value": [start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")]})
+            diag.update({"month": m, "year": y, "date_col": date_col, "temporal": "month_range",
+                         "added": diag["added"] + [{"type":"month_between", "col":date_col, "start":str(start.date()), "end":str(end.date())}]})
+
+    # 2) FUTURO / PASADO (si no hay mes explícito, o además de él si corresponde)
+    ti = spec.get("temporal_intent")
+    if ti is None:
+        if detect_future_intent_text(question): ti="future"
+        elif detect_past_intent_text(question): ti="past"
+
+    if ti in ("future","past") and not date_col:
+        date_col = choose_date_column_by_context(question, df)
+
+    if ti and date_col and date_col in df.columns:
+        today_str = TODAY.strftime("%Y-%m-%d")
+        # Quitamos posibles filtros previos en esa columna que choquen
+        spec_filters = [f for f in spec_filters if _map_col(f.get("column",""), list(df.columns)) != date_col]
+        if ti == "future":
+            spec_filters.append({"column": date_col, "op":"gte", "value":[today_str]})
+        elif ti == "past":
+            spec_filters.append({"column": date_col, "op":"lt", "value":[today_str]})
+        diag.update({"temporal": ti, "date_col": date_col,
+                     "added": diag["added"] + [{"type":ti, "col":date_col, "value":today_str}]})
+
+    spec["filters"] = spec_filters
+    return spec, diag
+
+# =========================
 #  Filtros exactos en pandas
 # =========================
 def _ensure_list(x):
@@ -380,10 +508,17 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
         col=_map_col(str(f.get("column","")), cols)
         op=str(f.get("op","")).strip()
         vals=_ensure_list(f.get("value", []))
-        if not col or col not in df.columns or not op: continue
+        if not col or col not in df.columns or not op:
+            continue
         s=df[col]; m=pd.Series(True,index=df.index)
 
         try:
+            # Asegurar datetime antes de comparaciones
+            if op in ["gt","gte","lt","lte","between_dates","month_eq"] and not pd.api.types.is_datetime64_any_dtype(s):
+                # solo si semánticamente es fecha, intenta parse
+                if any(w in _norm(col) for w in ["fecha","ingreso","salida","recep","pago","entrega","factur","inspe"]):
+                    s = ensure_datetime_series(s)
+
             if op in ["eq","neq","contains","not_contains","in","not_in"]:
                 sv=s.astype(str).str.upper().str.strip()
                 vlist=[str(v).upper().strip() for v in vals]
@@ -416,7 +551,6 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
                         if op=="lt": m=s<sd
                         if op=="lte": m=s<=sd
                 else:
-                    # comparación lexicográfica si no hay tipado
                     sv=s.astype(str); v=str(vals[0]) if vals else ""
                     if op=="gt": m=sv>v
                     if op=="gte": m=sv>=v
@@ -431,18 +565,23 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
             elif op=="between_dates":
                 sd=_to_datetime(vals[0]) if len(vals)>=1 and vals[0] else None
                 ed=_to_datetime(vals[1]) if len(vals)>=2 and vals[1] else None
-                s2=s if pd.api.types.is_datetime64_any_dtype(s) else pd.to_datetime(s, errors="coerce", dayfirst=True)
-                if sd is not None and ed is not None: m=s2.between(sd, ed)
-                elif sd is not None: m=s2>=sd
-                elif ed is not None: m=s2<=ed
-                else: m=pd.Series(True,index=df.index)
+                s2 = ensure_datetime_series(s)
+                if sd is not None and ed is not None:
+                    # inclusivo: [sd, ed] -> s2 >= sd & s2 < (ed+1)
+                    ed_next = ed + pd.Timedelta(days=1)
+                    m = (s2 >= sd) & (s2 < ed_next)
+                elif sd is not None:
+                    m = s2 >= sd
+                elif ed is not None:
+                    ed_next = ed + pd.Timedelta(days=1)
+                    m = s2 < ed_next
+                else:
+                    m=pd.Series(True,index=df.index)
 
             elif op=="month_eq":
-                # valor esperado: ["3"] → marzo
-                s2=s if pd.api.types.is_datetime64_any_dtype(s) else pd.to_datetime(s, errors="coerce", dayfirst=True)
+                s2 = ensure_datetime_series(s)
                 try:
-                    target=int(vals[0])
-                    m = s2.dt.month == target
+                    target=int(vals[0]); m = s2.dt.month == target
                 except Exception:
                     m = pd.Series(False,index=df.index)
 
@@ -455,6 +594,34 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
         mask &= m
         log.append({"column":col,"op":op,"value":vals,"remaining":int(mask.sum())})
     return df[mask].copy(), log
+
+# =========================
+#  DURACIÓN (lo que más tiempo lleva)
+# =========================
+def detect_duration_intent(question: str) -> bool:
+    q=_norm(question)
+    keys = [
+        "mas tiempo","más tiempo","lleva mas","lleva más","dias en taller","días en taller",
+        "tiempo en taller","antiguedad en taller","antigüedad en taller","desde ingreso","desde la recepcion"
+    ]
+    return any(k in q for k in keys)
+
+def compute_duration_table(df: pd.DataFrame, top_n: int = 10) -> Tuple[str, pd.DataFrame]:
+    """
+    Calcula días desde FECHA INGRESO PLANTA hasta HOY (TODAY).
+    Si no hay FECHA INGRESO PLANTA intenta FECHA RECEPCION.
+    """
+    if df.empty:
+        return "No hay datos para calcular duración.", df
+    base = df.copy()
+    col = "FECHA INGRESO PLANTA" if "FECHA INGRESO PLANTA" in base.columns else ("FECHA RECEPCION" if "FECHA RECEPCION" in base.columns else None)
+    if not col:
+        return "No existe columna de ingreso/recepción para calcular duración.", df
+    s = ensure_datetime_series(base[col])
+    base["DIAS_EN_TALLER_CALC"] = (TODAY - s).dt.days
+    out = base.sort_values("DIAS_EN_TALLER_CALC", ascending=False).head(top_n)
+    cols = [c for c in ["OT","PATENTE","NOMBRE CLIENTE","ESTADO SERVICIO","FECHA INGRESO PLANTA","DIAS_EN_TALLER_CALC"] if c in out.columns]
+    return f"Top {len(out)} vehículos con mayor tiempo en taller (al {TODAY.date()}):", out[cols] if cols else out
 
 # =========================
 #  RAG utilidades (embeddings, índice, retrieval)
@@ -558,7 +725,7 @@ def system_prompt() -> str:
 Eres un CONSULTOR DE GESTIÓN y ANALISTA DE DATOS para Fénix Automotriz.
 
 --- INSTRUCCIONES CLAVE DE RAZONAMIENTO ---
-1. INTERPRETACIÓN FLEXIBLE: Traduce la intención del usuario a los valores exactos de columnas.
+1. INTERPRETACIÓN FLEXIBLE: Traduce la intención del usuario a valores exactos de columnas.
    - "¿Está lista la OT X?" → revisar 'ESTADO SERVICIO' ∈ {{ENTREGADO, FINALIZADO, TERMINADO}}.
    - "¿La patente XYZ ya fue facturada?" → 'FACTURADO'=='SI' o existencia de 'NUMERO DE FACTURA'/'FECHA DE FACTURACION'.
 2. SINÓNIMOS/CAMPOS: listo/terminado/entregado → ESTADO SERVICIO; sin aprobar → ESTADO PRESUPUESTO != APROBADO;
@@ -579,27 +746,8 @@ def build_user_prompt(question: str, context_docs: List[str]) -> str:
     return f"{instruction}\n\nContexto proporcionado (subconjunto filtrado estrictamente):\n{ctx}\n\nPregunta del usuario: {question}"
 
 # =========================
-#  Orquestador Paso 1 → Paso 2
+#  Orquestador de Dos Pasos (con TIEMPO centralizado)
 # =========================
-def enforce_temporal_guardrail(filters_spec: Dict[str,Any], df: pd.DataFrame) -> Dict[str,Any]:
-    """
-    Si el LLM detecta 'temporal_intent'='future', fuerza >= hoy en columna de fecha preferida o inferida.
-    """
-    ti = filters_spec.get("temporal_intent")
-    if ti != "future": return filters_spec
-    col = filters_spec.get("preferred_date_column") or None
-    if not col:
-        q_text = ""  # ya no tenemos pregunta aquí; si quieres, pásala y decide por keywords
-        # fallback: privilegia pago -> facturación -> entrega
-        for c in ["FECHA DE PAGO FACTURA","FECHA DE FACTURACION","FECHA ENTREGA","FECHA INGRESO PLANTA"]:
-            if c in df.columns: col=c; break
-    if not col or col not in df.columns: return filters_spec
-    today = dt.date.today().strftime("%Y-%m-%d")
-    extra = {"column": col, "op":"gte", "value":[today]}
-    filters_spec = dict(filters_spec)
-    filters_spec["filters"] = (filters_spec.get("filters") or []) + [extra]
-    return filters_spec
-
 def requires_totals(question: str) -> bool:
     q=_norm(question)
     return any(k in q for k in ["total","suma","sumar","monto","factur","neto","bruto","iva","ingreso"])
@@ -614,23 +762,29 @@ def append_totals_row(display_df: pd.DataFrame) -> pd.DataFrame:
             total_row[col]=pd.to_numeric(display_df[col], errors="coerce").sum(skipna=True)
     return pd.concat([display_df, pd.DataFrame([total_row], columns=display_df.columns)], ignore_index=True)
 
-def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6) -> Tuple[str, pd.DataFrame, Dict[str,Any], List[str]]:
+def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6) -> Tuple[str, pd.DataFrame, Dict[str,Any], List[str], Dict[str,Any]]:
     """
-    Orquesta el flujo de dos pasos:
-      1) get_filters_from_query → filtros estrictos
-      2) apply_filters en pandas → subconjunto
-      3) RAG sobre el subconjunto → docs top-k
-      4) LLM para redacción final
-    Devuelve: (respuesta, subset, filtros_aplicados, docs_usados)
+    Paso 1: get_filters_from_query -> filtros estrictos
+    Paso 1b: time_enforcer_attach -> aplica intención temporal + mes
+    Paso 2: apply_filters -> subconjunto
+    Paso 2a: RAG sobre el subconjunto
+    Paso 2b: LLM redacta respuesta final
+    Devuelve: (respuesta, subset, filtros_aplicados, docs, diag_tiempo)
     """
+    # Caso determinista: DURACIÓN
+    if detect_duration_intent(question):
+        txt, tbl = compute_duration_table(base_df)
+        return txt, tbl, {"filters":[]}, [], {"duration": True}
+
     # Paso 1: LLM traductor → filtros
     spec = get_filters_from_query(question, base_df)
-    spec = enforce_temporal_guardrail(spec, base_df)  # fuerza >= hoy si 'future'
+    # Paso 1b: Enforce de tiempo unificado
+    spec, time_diag = time_enforcer_attach(question, spec, base_df)
 
     # Aplicar filtros
     filtered_df, log = apply_filters(base_df, spec.get("filters", []))
 
-    # Si quedó vacío, intentamos un fallback leve: quitamos 'contains/not_contains' y reintentamos
+    # Si vacío, probamos un soft fallback sin contains/not_contains
     if filtered_df.empty and spec.get("filters"):
         soft = [f for f in spec["filters"] if f.get("op") not in ("contains","not_contains")]
         if soft != spec["filters"]:
@@ -638,16 +792,18 @@ def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6) -> Tuple[st
             spec = dict(spec); spec["filters"] = soft
 
     # Sin datos → respuesta determinista
-    if filtered_df.empty:
-        return "No se encontraron datos que coincidan con la búsqueda.", filtered_df, spec, []
+    if isinstance(filtered_df, pd.DataFrame) and filtered_df.empty:
+        return "No se encontraron datos que coincidan con la búsqueda.", filtered_df, spec, [], time_diag
 
     # Paso 2a: RAG SOLO sobre el subconjunto
-    frags, ids = make_fragments(filtered_df)
+    if isinstance(filtered_df, pd.DataFrame):
+        frags, ids = make_fragments(filtered_df)
+    else:
+        # Si compute_duration_table devolvió DataFrame como "subset"
+        frags, ids = make_fragments(base_df)
     ensure_index(frags, ids)
     docs, row_ids = retrieve_top_subset(question, k=top_k)
-
-    # Si por alguna razón docs vacío (subset muy pequeño), usa hasta 10 filas del subset
-    if not docs:
+    if not docs and isinstance(filtered_df, pd.DataFrame) and not filtered_df.empty:
         sample = filtered_df.head(min(10, len(filtered_df))).apply(lambda r: row_to_fragment(r, [c for c in CANONICAL_FIELDS if c in filtered_df.columns]), axis=1).tolist()
         docs = sample
 
@@ -658,7 +814,7 @@ def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6) -> Tuple[st
     resp=client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.2)
     answer = resp.choices[0].message.content
 
-    return answer, filtered_df, spec, docs
+    return answer, filtered_df, spec, docs, time_diag
 
 # =========================
 #  UI / NAVEGACIÓN
@@ -694,7 +850,7 @@ df = normalize_df(raw_df)
 c1, c2 = st.columns([5,1])
 with c1:
     st.title("Consulta Nexa IA")
-    st.caption("Asistente de análisis para Fénix Automotriz (RAG de dos pasos + filtros exactos)")
+    st.caption("Asistente de análisis para Fénix Automotriz (RAG de dos pasos + tiempo centralizado)")
 with c2:
     st.markdown('<div class="nexa-topbar">', unsafe_allow_html=True)
     safe_image("Fenix_isotipo.png", width=72)
@@ -725,28 +881,31 @@ def page_chat():
     if not question:
         return
 
-    # Orquestación de dos pasos
     if force_index:
         for k in ["subset_index_hash","subset_collection","subset_embs","subset_ids","subset_docs","subset_backend"]:
             st.session_state.pop(k, None)
 
-    answer, subset, spec, docs = llm_answer(question, df.copy(), top_k=top_k)
+    answer, subset, spec, docs, time_diag = llm_answer(question, df.copy(), top_k=top_k)
 
     st.session_state.stats["queries"] += 1
-    st.session_state.stats["tokens_est"] += estimate_tokens(question, *docs, answer)
+    st.session_state.stats["tokens_est"] += estimate_tokens(question, *(docs or []), answer)
     st.session_state.messages += [{"role":"user","content":question},
                                   {"role":"assistant","content":answer}]
 
     with st.chat_message("assistant", avatar=BOT_AVATAR):
         if show_diag:
-            with st.expander("🧭 Diagnóstico (Paso 1 → Paso 2)", expanded=False):
+            with st.expander("🧭 Diagnóstico (Tiempo + Filtros)", expanded=False):
+                st.write("**Hoy (America/Santiago)**:", str(TODAY.date()))
                 st.write("**Esquema**:", infer_schema_for_llm(df))
-                st.write("**Filtros generados (Paso 1)**:", spec)
-                st.write("**Filas en subconjunto**:", len(subset))
-                st.write("**Docs usados (muestra)**:", docs[:2])
+                st.write("**Intención temporal aplicada**:", time_diag)
+                st.write("**Filtros (Paso 1 final)**:", spec)
+                if isinstance(subset, pd.DataFrame):
+                    st.write("**Filas en subconjunto**:", len(subset))
+                st.write("**Docs usados (muestra)**:", (docs or [])[:2])
         st.markdown(answer)
 
-        if not subset.empty:
+        # Auditoría del subconjunto
+        if isinstance(subset, pd.DataFrame) and not subset.empty:
             show_cols=[c for c in CANONICAL_FIELDS if c in subset.columns]
             to_show = subset[show_cols] if show_cols else subset.copy()
             if requires_totals(question):
@@ -760,16 +919,19 @@ def page_chat():
 def page_analytics():
     st.subheader("Análisis de negocio (rápido)")
     if "FECHA DE FACTURACION" in df.columns and "MONTO PRINCIPAL NETO" in df.columns and "TIPO CLIENTE" in df.columns:
-        month = st.selectbox("Mes", list(SPANISH_MONTHS.keys()), index=2)  # marzo por defecto
-        year = st.number_input("Año", value=dt.date.today().year, step=1)
+        # Selector con mes relativo funcionando con TODAY
+        month_names = list(SPANISH_MONTHS.keys())
+        default_idx = TODAY.month - 1
+        month = st.selectbox("Mes", month_names, index=default_idx)
+        year = st.number_input("Año", value=int(TODAY.year), step=1)
         m = SPANISH_MONTHS[month]
-        s = df["FECHA DE FACTURACION"]
-        s = s if pd.api.types.is_datetime64_any_dtype(s) else pd.to_datetime(s, errors="coerce", dayfirst=True)
-        sub = df[(s.dt.year==int(year)) & (s.dt.month==m)].copy()
+        s = ensure_datetime_series(df["FECHA DE FACTURACION"])
+        start, end = month_range_boundaries(int(year), int(m))
+        sub = df[(s >= start) & (s < (end + pd.Timedelta(days=1)))].copy()
         st.dataframe(sub, use_container_width=True, hide_index=True)
         g = (sub.groupby("TIPO CLIENTE", dropna=False)["MONTO PRINCIPAL NETO"]
                .sum(min_count=1).fillna(0.0).sort_values(ascending=False))
-        st.markdown("#### Facturación por TIPO CLIENTE")
+        st.markdown(f"#### Facturación por TIPO CLIENTE — {int(year)}-{int(m):02d}")
         st.bar_chart(g)
     else:
         st.info("Faltan columnas para este análisis (FECHA DE FACTURACION, TIPO CLIENTE, MONTO PRINCIPAL NETO).")
@@ -790,6 +952,8 @@ def page_diagnostics():
     c2.metric("Tokens estimados", f"{st.session_state.stats['tokens_est']:,}".replace(",", "."))
     st.markdown("#### Esquema detectado")
     st.json(infer_schema_for_llm(df))
+    st.markdown("#### Hoy (America/Santiago)")
+    st.write(str(TODAY))
     st.markdown("#### Dimensión de datos")
     st.write(f"Filas: {len(df):,} — Columnas: {len(df.columns)}".replace(",", "."))
 
@@ -800,28 +964,19 @@ def page_support():
     safe_image("Nexa_logo.png", width=180)
 
 # Router
-with st.sidebar:
+if not st.session_state.authed:
     pass
-if "nav" not in st.session_state:
-    pass
-
-with st.sidebar:
-    pass
-
-with st.sidebar:
-    pass
-
-nav_choice = nav
-if nav_choice == "Consulta IA":
-    page_chat()
-elif nav_choice == "Análisis de negocio":
-    page_analytics()
-elif nav_choice == "Configuración":
-    page_settings()
-elif nav_choice == "Diagnóstico y uso":
-    page_diagnostics()
-elif nav_choice == "Soporte":
-    page_support()
+else:
+    if nav == "Consulta IA":
+        page_chat()
+    elif nav == "Análisis de negocio":
+        page_analytics()
+    elif nav == "Configuración":
+        page_settings()
+    elif nav == "Diagnóstico y uso":
+        page_diagnostics()
+    elif nav == "Soporte":
+        page_support()
 
 # Footer
 st.markdown('<div class="nexa-footer">Desarrollado por Nexa Corp. todos los derechos reservados.</div>', unsafe_allow_html=True)
