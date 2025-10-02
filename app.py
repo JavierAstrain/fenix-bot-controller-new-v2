@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Consulta Nexa IA — Fénix Automotriz
-RAG de Dos Pasos con manejo universal y CONSISTENTE de fechas:
-- Conversión única de todas las columnas de fecha a pandas.Timestamp (datetime64[ns]) al cargar
-- Comparaciones en apply_filters SIEMPRE contra Timestamp (incluye futuro, pasado, month, rangos)
+Corrección definitiva:
+- Carga segura: SOLO columnas listadas en DATE_COLUMNS se convierten a datetime64[ns] (Timestamp)
+- Reglas de negocio reforzadas: "facturas a pagar (futuro)" => FACTURADO == 'SI' + FECHA DE PAGO FACTURA >= HOY
+- Comparaciones de fecha SIEMPRE con pandas.Timestamp
 """
 
 import os, re, json, hashlib
@@ -47,7 +48,7 @@ def safe_image(name_or_path: str, **kwargs) -> bool:
 # =========================
 st.set_page_config(
     page_title="Consulta Nexa IA",
-    page_icon=safe_page_icon("Isotipo_Nexa.png"),  # favicon Nexa
+    page_icon=safe_page_icon("Isotipo_Nexa.png"),
     layout="wide",
 )
 
@@ -128,8 +129,8 @@ CANONICAL_FIELDS = [
     "CANTIDAD DE VEHICULO","DIAS DE PAGO DE FACTURA",
 ]
 
-# UNIVERSAL: columnas de fecha (todas las que deberían tratarse como fechas)
-DATE_FIELDS = [
+# === SOLO ESTAS se convierten a fecha (evita corromper el DF) ===
+DATE_COLUMNS = [
     "FECHA INGRESO PLANTA","FECHA SALIDA PLANTA","FECHA INSPECCIÓN",
     "FECHA RECEPCION","FECHA ENTREGA","FECHA DE FACTURACION","FECHA DE PAGO FACTURA",
 ]
@@ -169,7 +170,7 @@ SPANISH_MONTHS = {
 SPANISH_MONTHS_ABBR = {"ene":1,"feb":2,"mar":3,"abr":4,"may":5,"jun":6,"jul":7,"ago":8,"sep":9,"set":9,"oct":10,"nov":11,"dic":12}
 
 # =========================
-#  NORMALIZADORES / UTILS
+#  UTILS
 # =========================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", unidecode(str(s)).strip().lower())
@@ -185,25 +186,20 @@ def _map_col(col: str, available: List[str]) -> Optional[str]:
         if key in _norm(a): return a
     return None
 
-def _to_number(x) -> Optional[float]:
-    try:
-        if pd.isna(x): return None
-        if isinstance(x,(int,float)): return float(x)
-        s=str(x).strip().replace(" ","").replace("$","").replace(".","").replace(",",".")
-        return float(s) if re.match(r"^-?\d+(\.\d+)?$", s) else None
-    except Exception:
-        return None
-
 def _to_datetime(x) -> Optional[pd.Timestamp]:
     try:
         return pd.to_datetime(x, dayfirst=True, errors="coerce")
     except Exception:
         return None
 
+def _series_as_ts(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
 # =========================
-#  TIEMPO — referencia consistente
+#  TIEMPO CONSISTENTE
 # =========================
-# Hoy como Timestamp (naive) para compararlo DIRECTO con columnas datetime64[ns]
 TODAY_TS = pd.Timestamp(dt.date.today())
 
 def month_range_boundaries(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
@@ -305,8 +301,13 @@ def get_data_from_gsheet() -> pd.DataFrame:
     return pd.DataFrame(rec) if rec else pd.DataFrame()
 
 def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza nombres, números y —UNIVERSAL— convierte fechas a pandas.Timestamp (datetime64[ns]) una sola vez."""
+    """
+    Normaliza nombres, numéricos, y convierte SOLO DATE_COLUMNS a Timestamp.
+    Evita convertir columnas erróneas como PATENTE o MONTO a fechas.
+    """
     if raw.empty: return raw.copy()
+
+    # Mapear encabezados a canónicos
     mapping={}
     for c in raw.columns:
         key=_norm(c)
@@ -315,19 +316,19 @@ def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
         if key in COL_ALIASES: mapping[c]=COL_ALIASES[key]
     df=raw.rename(columns=mapping).copy()
 
-    # --- UNIVERSAL: convertir TODAS las columnas de fecha a pandas.Timestamp (errors='coerce') ---
-    for col in DATE_FIELDS:
+    # === SOLO estas columnas se convierten a fecha (Timestamp) ===
+    for col in DATE_COLUMNS:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)  # datetime64[ns]
+            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
 
-    # Números
-    for col in NUM_FIELDS:
-        if col in df.columns:
-            df[col]=(df[col].astype(str)
-                        .str.replace(r"[ $]","",regex=True)
-                        .str.replace(".","",regex=False)
-                        .str.replace(",",".",regex=False))
-            df[col]=pd.to_numeric(df[col], errors="coerce")
+    # Números (los conocidos)
+    num_fields = [c for c in NUM_FIELDS if c in df.columns]
+    for col in num_fields:
+        df[col]=(df[col].astype(str)
+                    .str.replace(r"[ $]","",regex=True)
+                    .str.replace(".","",regex=False)
+                    .str.replace(",",".",regex=False))
+        df[col]=pd.to_numeric(df[col], errors="coerce")
 
     # Facturado normalizado
     if "FACTURADO" in df.columns:
@@ -345,18 +346,62 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 # =========================
-#  Paso 1: LLM → filtros estrictos
+#  Paso 1: LLM → filtros estrictos (con regla reforzada)
 # =========================
 def infer_schema_for_llm(df: pd.DataFrame) -> Dict[str,Any]:
+    """
+    NO intentar inferir fecha con pd.to_datetime en columnas arbitrarias (corrompe).
+    Solo marcar como 'date' si está en DATE_COLUMNS; luego number/text por dtype.
+    """
     schema={}
     for c in df.columns:
-        s=df[c]
-        # Si la serie puede convertirse, la tratamos como date
-        if pd.api.types.is_datetime64_any_dtype(pd.to_datetime(s, errors="coerce")) or c in DATE_FIELDS:
+        if c in DATE_COLUMNS:
             schema[c]="date"
-        elif pd.api.types.is_numeric_dtype(s):     schema[c]="number"
-        else:                                      schema[c]="text"
+        elif pd.api.types.is_numeric_dtype(df[c]):
+            schema[c]="number"
+        else:
+            schema[c]="text"
     return schema
+
+def _contains_factura_pago_futuro(question: str) -> bool:
+    q=_norm(question)
+    return (("factur" in q or "factura" in q) and
+            any(k in q for k in ["pagar","pago","venc","por pagar","pendiente","futuro","próxim","proxim"]))
+
+def enforce_business_rules_on_filters(question: str, spec: Dict[str,Any], df: pd.DataFrame) -> Dict[str,Any]:
+    """
+    Si la intención es "facturas a pagar (futuro)":
+      - FACTURADO == 'SI'
+      - FECHA DE PAGO FACTURA >= HOY
+    Agregar si faltan o corregir si vinieron mal.
+    """
+    out = dict(spec)
+    flt = list(out.get("filters") or [])
+    cols = list(df.columns)
+
+    def add_or_replace(column: str, op: str, value: List[str]):
+        nonlocal flt
+        mapped = _map_col(column, cols)
+        if not mapped: return
+        # Eliminar entradas previas del mismo col que choquen
+        flt = [f for f in flt if _map_col(f.get("column",""), cols) != mapped]
+        flt.append({"column": mapped, "op": op, "value": value})
+
+    if _contains_factura_pago_futuro(question):
+        # 1) FACTURADO == 'SI'
+        add_or_replace("FACTURADO", "eq", ["SI"])
+        # 2) FECHA DE PAGO FACTURA >= HOY (gte_today)
+        if "FECHA DE PAGO FACTURA" in cols:
+            add_or_replace("FECHA DE PAGO FACTURA", "gte_today", [TODAY_TS.isoformat()])
+
+        # Además marca la intención temporal si no viene
+        if not out.get("temporal_intent"):
+            out["temporal_intent"] = "future"
+        if not out.get("preferred_date_column"):
+            out["preferred_date_column"] = "FECHA DE PAGO FACTURA"
+
+    out["filters"] = flt
+    return out
 
 def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
     client=get_openai_client()
@@ -367,6 +412,7 @@ def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
         "Usa SOLO nombres de columnas existentes. Devuelve SOLO JSON."
     )
     rules = """
+REGLAS DE NEGOCIO CLAVE:
 - 'lista/terminado/entregado/finalizado' → ESTADO SERVICIO IN ['ENTREGADO','FINALIZADO','TERMINADO'].
 - 'sin aprobar' → ESTADO PRESUPUESTO != 'APROBADO'.
 - 'sin factura/no facturado' → FACTURADO != 'SI' OR NUMERO DE FACTURA empty OR FECHA DE FACTURACION empty.
@@ -375,8 +421,13 @@ def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
   * 'próximos días', 'en adelante', 'por pagar', 'pendientes de pago', 'vencen' → temporal_intent='future'
   * 'anteriores', 'pasado' → temporal_intent='past'
 - Columna fecha preferida: pago→FECHA DE PAGO FACTURA; factura→FECHA DE FACTURACION; entrega→FECHA ENTREGA.
+
+REGLA REFORZADA (FACTURAS A PAGAR - FUTURO):
+- Si la pregunta menciona facturas y una condición temporal futura (por pagar, vencen, próximos días/mes):
+  * Añade: {"column":"FACTURADO","op":"eq","value":["SI"]}
+  * Añade: {"column":"FECHA DE PAGO FACTURA","op":"gte_today","value":[<hoy ISO>]}
 """
-    user = f"Esquema:\n{schema}\n\nReglas:\n{rules}\n\nPregunta:\n{question}\n\nDevuelve SOLO la llamada a función."
+    user = f"Esquema (columna:tipo):\n{schema}\n\nReglas:\n{rules}\n\nPregunta:\n{question}\n\nDevuelve SOLO la llamada a función."
 
     tools=[{
         "type":"function",
@@ -416,10 +467,13 @@ def get_filters_from_query(question: str, df: pd.DataFrame) -> Dict[str,Any]:
                 out.update({k:v for k,v in cand.items() if k in out})
     except Exception:
         pass
+
+    # Refuerzo post-LLM para "facturas a pagar (futuro)"
+    out = enforce_business_rules_on_filters(question, out, df)
     return out
 
 # =========================
-#  ENFORCER DE TIEMPO (central, agrega filtros de fecha)
+#  ENFORCER DE TIEMPO (agrega filtros de fecha cuando falten)
 # =========================
 def month_range_boundaries_dates(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
     start = pd.Timestamp(year=int(year), month=int(month), day=1)
@@ -478,7 +532,7 @@ def time_enforcer_attach(question: str, spec: Dict[str,Any], df: pd.DataFrame) -
     return spec, diag
 
 # =========================
-#  Filtros exactos en pandas (UNIVERSAL Timestamp)
+#  Filtros exactos en pandas (Timestamp)
 # =========================
 def _ensure_list(x):
     if isinstance(x,list): return x
@@ -498,24 +552,13 @@ def _month_token_to_int(tok: str) -> Optional[int]:
     if t in SPANISH_MONTHS_ABBR: return SPANISH_MONTHS_ABBR[t]
     return None
 
-def _series_as_ts(s: pd.Series) -> pd.Series:
-    """Convierte segura y universalmente a pandas.Timestamp (datetime64[ns])."""
-    if pd.api.types.is_datetime64_any_dtype(s):
-        return s
-    return pd.to_datetime(s, errors="coerce", dayfirst=True)
-
 def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.DataFrame, List[Dict[str,Any]]]:
     """
-    Solución universal CONSISTENTE:
-    - TODAS las comparaciones temporales se hacen sobre Series pandas.Timestamp (datetime64[ns])
-    - TODAY_TS es Timestamp, por lo que no hay mezcla de tipos
-    - Operadores soportados:
-        eq, neq, in, not_in, contains, not_contains
-        gt, gte, lt, lte (numérico y fecha)
-        between_dates (rango inclusivo, fechas)
-        month_eq (1..12 o 'marzo'/'mar')
-        empty, not_empty
-        future/gte_today, past/lt_today (atajos)
+    Comparaciones de fecha SIEMPRE con Timestamp:
+        - gt/gte/lt/lte (fecha)
+        - between_dates
+        - month_eq
+        - future/gte_today, past/lt_today
     """
     if df.empty or not filters: 
         return df.copy(), []
@@ -547,7 +590,7 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
         m=pd.Series(True, index=df2.index)
 
         try:
-            is_date = (col in DATE_FIELDS) or ("fecha" in _norm(col) or "ingreso" in _norm(col) or "entrega" in _norm(col) or "pago" in _norm(col) or "factur" in _norm(col))
+            is_date = (col in DATE_COLUMNS)  # ESTRICTO: solo las declaradas
             s_ts = _series_as_ts(s) if is_date else None
 
             if op in ["eq","neq","contains","not_contains","in","not_in"]:
@@ -576,9 +619,8 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
                         if op=="lt":  m=sn<val
                         if op=="lte": m=sn<=val
 
-                # FECHA universal
+                # FECHA (Timestamp)
                 elif is_date:
-                    # valor puede ser 'HOY'/'TODAY' o fecha -> convertir a Timestamp
                     val_ts=None
                     if vals:
                         token=str(vals[0]).strip().upper()
@@ -586,7 +628,7 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
                         else:
                             td=_to_datetime(vals[0])
                             val_ts = td if (td is not None and pd.notna(td)) else None
-                    if val_ts is None and op in ("gt","gte"):  # atajo: >= HOY si no vino valor
+                    if val_ts is None and op in ("gt","gte"):
                         val_ts=today_ts
                     has_date = s_ts.notna()
                     if val_ts is None:
@@ -597,8 +639,7 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
                         if op=="lt":  m = has_date & (s_ts <  val_ts)
                         if op=="lte": m = has_date & (s_ts <= val_ts)
 
-                # TEXTO (fallback)
-                else:
+                else:  # TEXTO fallback
                     sv=s.astype(str)
                     v=str(vals[0]) if vals else ""
                     if op=="gt":  m=sv>v
@@ -625,16 +666,17 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
             elif op=="month_eq":
                 if is_date:
                     month_token = vals[0] if vals else None
-                    target = _month_token_to_int(month_token)
+                    target = None
+                    if month_token is not None:
+                        t=_norm(str(month_token))
+                        target = int(t) if t.isdigit() else (SPANISH_MONTHS.get(t) or SPANISH_MONTHS_ABBR.get(t))
                     if target is None:
                         m = pd.Series(False, index=df2.index)
                     else:
-                        m = (s_ts.dt.month == int(target))
-                        m = m.fillna(False)
+                        m = (s_ts.dt.month == int(target)).fillna(False)
                 else:
                     m = pd.Series(False, index=df2.index)
 
-            # ATAJOS universales
             elif op in ["future","gte_today",">hoy"]:
                 if is_date:
                     has_date = s_ts.notna()
@@ -661,7 +703,7 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str,Any]]) -> Tuple[pd.Da
     return df2[mask].copy(), log
 
 # =========================
-#  DURACIÓN (usa Timestamp)
+#  DURACIÓN
 # =========================
 def detect_duration_intent(question: str) -> bool:
     q=_norm(question)
@@ -685,7 +727,7 @@ def compute_duration_table(df: pd.DataFrame, top_n: int = 10) -> Tuple[str, pd.D
     return f"Top {len(out)} vehículos con mayor tiempo en taller (al {TODAY_TS.date()}):", out[cols] if cols else out
 
 # =========================
-#  RAG (embeddings, índice, retrieval)
+#  RAG (embeddings, índice, retrieval) + formateo robusto
 # =========================
 CHROMA_AVAILABLE=True
 try:
@@ -693,14 +735,7 @@ try:
 except Exception:
     CHROMA_AVAILABLE=False
 
-# ----------- Formateo robusto (incluye Timestamp y NaT) -----------
 def _fmt_value(v) -> str:
-    """
-    - Nulos (None/NaN/NaT) → ""
-    - Fechas (date/datetime/pd.Timestamp) → YYYY-MM-DD (sin re-convertir)
-    - Números → string con recorte de ceros
-    - Texto vacío/"nan" → ""
-    """
     try:
         if v is None or (not isinstance(v, str) and pd.isna(v)):
             return ""
@@ -712,7 +747,6 @@ def _fmt_value(v) -> str:
             return ""
         return s
     if isinstance(v, (pd.Timestamp, dt.datetime, dt.date)):
-        # Asegura formateo consistente aun si viene Timestamp con tz
         try:
             return pd.Timestamp(v).strftime("%Y-%m-%d")
         except Exception:
@@ -857,7 +891,7 @@ def llm_answer(question: str, base_df: pd.DataFrame, top_k: int = 6):
     spec, time_diag = time_enforcer_attach(question, spec, base_df)
     filtered_df, log = apply_filters(base_df, spec.get("filters", []))
 
-    # Post-filtro "por pagar / no pagadas": fecha de pago NaN o >= hoy (Timestamp-consistente)
+    # Post-filtro "por pagar / no pagadas": fecha de pago NaN o >= HOY (Timestamp)
     if detect_unpaid_intent(question) and isinstance(filtered_df, pd.DataFrame) and not filtered_df.empty:
         if "FECHA DE PAGO FACTURA" in filtered_df.columns:
             s_ts = _series_as_ts(filtered_df["FECHA DE PAGO FACTURA"])
@@ -937,6 +971,10 @@ def estimate_tokens(*texts) -> int:
 # =========================
 #  Páginas
 # =========================
+def requires_totals(question: str) -> bool:
+    q=_norm(question)
+    return any(k in q for k in ["total","suma","sumar","monto","factur","neto","bruto","iva","ingreso"])
+
 def page_chat():
     with st.expander("⚙️ Parámetros de consulta", expanded=False):
         top_k = st.slider("Top-K fragmentos para contexto", 3, 15, 6, 1, key="top_k_chat")
